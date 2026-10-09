@@ -1,0 +1,44 @@
+name: agora-storage-broker
+services:
+  storage-broker:
+    image: haproxy:3.2-alpine@sha256:5d97434a423c2533cfeb42874d45cf6d69a840b60334582dfbfd5008e94c80be
+    container_name: agora-storage-broker
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      STORAGE_MSSQL_UPSTREAM: ${STORAGE_MSSQL_UPSTREAM:-mssql:1433}
+      STORAGE_ES_UPSTREAM: ${STORAGE_ES_UPSTREAM:-elasticsearch:9200}
+      STORAGE_REDIS_PRIMARY_UPSTREAM: ${STORAGE_REDIS_PRIMARY_UPSTREAM:-172.20.0.2:6379}
+      STORAGE_REDIS_REPLICA_1_UPSTREAM: ${STORAGE_REDIS_REPLICA_1_UPSTREAM:-172.20.0.7:6379}
+      STORAGE_REDIS_REPLICA_2_UPSTREAM: ${STORAGE_REDIS_REPLICA_2_UPSTREAM:-172.20.0.5:6379}
+      STORAGE_SENTINEL_1_UPSTREAM: ${STORAGE_SENTINEL_1_UPSTREAM:-172.20.0.6:26379}
+      STORAGE_SENTINEL_2_UPSTREAM: ${STORAGE_SENTINEL_2_UPSTREAM:-172.20.0.3:26379}
+      STORAGE_SENTINEL_3_UPSTREAM: ${STORAGE_SENTINEL_3_UPSTREAM:-172.20.0.4:26379}
+    volumes:
+      - ./storage-broker/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      agora-services:
+        aliases: [agora-mssql, agora-elasticsearch]
+      agora-net: {}
+      redis-ha: {}
+    healthcheck:
+      test: [CMD, haproxy, -c, -f, /usr/local/etc/haproxy/haproxy.cfg]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+networks:
+  agora-services:
+    name: agora-services
+    internal: true
+    ipam:
+      config:
+        - subnet: ${AGORA_SERVICES_SUBNET:-172.23.0.0/16}
+  agora-net:
+    external: true
+    name: agora-net
+  redis-ha:
+    external: true
+    name: agora-redis-ha

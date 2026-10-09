@@ -1,0 +1,58 @@
+name: agora-gateway
+
+services:
+  nginx:
+    image: nginx:stable-alpine
+    container_name: agora-nginx
+    restart: unless-stopped
+    environment:
+      FRONTEND_MODE: ${FRONTEND_MODE:-production}
+      NGINX_HTTPS_PORT: ${NGINX_HTTPS_PORT:-8443}
+      BROKER_TLS_SERVER_NAME: ${BROKER_TLS_SERVER_NAME:-agora-broker}
+      NGINX_ENVSUBST_FILTER: ^(FRONTEND_MODE|NGINX_HTTPS_PORT|BROKER_TLS_SERVER_NAME)$
+    ports:
+      - "127.0.0.1:${NGINX_HTTPS_PORT:-8443}:443"
+    volumes:
+      - ./nginx/10-validate-mode.sh:/docker-entrypoint.d/10-validate-mode.sh:ro
+      - ./nginx/cpp-routes.conf:/etc/nginx/routes/cpp-routes.conf:ro
+      - ./nginx/agora.conf.example:/etc/nginx/templates/default.conf.template:ro
+      - frontend-dist:/usr/share/nginx/html:ro
+      - type: bind
+        source: ${NGINX_TLS_CERT_DIR:-./.local-certs/https}/fullchain.pem
+        target: /etc/nginx/ssl/agora/fullchain.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NGINX_TLS_CERT_DIR:-./.local-certs/https}/privkey.pem
+        target: /etc/nginx/ssl/agora/privkey.pem
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${NGINX_TLS_CERT_DIR:-./.local-certs/https}/root-ca.pem
+        target: /etc/nginx/ssl/agora/ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      agora-services:
+        ipv4_address: ${NGINX_BACKEND_IP:-172.23.0.250}
+      agora-web: {}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "--show-error", "--cacert", "/etc/nginx/ssl/agora/ca.pem", "https://localhost/nginx-health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  agora-services:
+    external: true
+    name: agora-services
+  agora-web:
+    name: agora-web
+
+volumes:
+  frontend-dist:
+    name: agora-frontend-dist

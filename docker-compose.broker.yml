@@ -1,0 +1,76 @@
+name: agora-broker
+services:
+  broker:
+    build:
+      context: ./broker
+    image: project-agora-broker:local
+    container_name: agora-broker
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=700
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      SERVICE_TLS_CERT: /run/tls/fullchain.pem
+      SERVICE_TLS_KEY: /run/tls/privkey.pem
+      SERVICE_TLS_CA: /run/tls/ca.pem
+      BROKER_TRUSTED_PROXY_IPS: ${BROKER_TRUSTED_PROXY_IPS:-${NGINX_BACKEND_IP:-172.23.0.250}}
+      JWT_SECRET: ${JWT_SECRET:?Use the same JWT signing key as Spring}
+      BROKER_CPP_IDENTITIES: ${BROKER_CPP_IDENTITIES:-{}}
+      BROKER_CPP_TARGETS: ${BROKER_CPP_TARGETS:?Run scripts/setup.py to configure WSS routes}
+      CPP_INTERNAL_API_TOKEN: ${CPP_INTERNAL_API_TOKEN:?Configure the same internal token as BE}
+      BROKER_SECRET_KEY_BASE: ${BROKER_SECRET_KEY_BASE:?Run scripts/setup.py}
+      BROKER_ALLOWED_ORIGINS: ${BROKER_ALLOWED_ORIGINS:-https://localhost:8443,https://127.0.0.1:8443}
+    depends_on:
+      broker-tls-init:
+        condition: service_completed_successfully
+    volumes:
+      - broker-tls:/run/tls:ro
+    networks: [agora-services]
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, --cacert, /run/tls/ca.pem, --resolve, "${BROKER_TLS_SERVER_NAME:-agora-broker}:4443:127.0.0.1", "https://${BROKER_TLS_SERVER_NAME:-agora-broker}:4443/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  broker-tls-init:
+    image: alpine:3.24
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        cp /source/fullchain.pem /target/fullchain.pem
+        cp /source/privkey.pem /target/privkey.pem
+        cp /source/ca.pem /target/ca.pem
+        chown -R 10001:10001 /target
+        chmod 700 /target
+        chmod 600 /target/privkey.pem
+        chmod 644 /target/fullchain.pem /target/ca.pem
+    volumes:
+      - type: bind
+        source: ${BROKER_TLS_CERT_DIR:?Supply broker certificates}/fullchain.pem
+        target: /source/fullchain.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${BROKER_TLS_CERT_DIR:?Supply broker certificates}/privkey.pem
+        target: /source/privkey.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${NGINX_TLS_CERT_DIR:?Configure gateway certificates}/root-ca.pem
+        target: /source/ca.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - broker-tls:/target
+networks:
+  agora-services:
+    external: true
+    name: agora-services
+volumes:
+  broker-tls:
+    name: agora-broker-tls
