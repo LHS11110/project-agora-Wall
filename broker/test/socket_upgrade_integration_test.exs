@@ -88,4 +88,21 @@ defmodule AgoraBroker.SocketUpgradeIntegrationTest do
                3_000
              )
   end
+  test "expected companion shutdown closes a real WebSocket without crash logs", %{gun: gun} do
+    token = JwtFixture.sign(JwtFixture.claims())
+    stream = :gun.ws_upgrade(gun, "/broker/websocket?canvas_id=1&ws_port=8002&token=" <> token)
+    assert_receive {:gun_upgrade, ^gun, ^stream, ["websocket"], _}, 3_000
+    assert_receive {:gun_ws, ^gun, ^stream, {:text, payload}}, 3_000
+    connection = Jason.decode!(payload)["rtc_canvas_connection_id"]
+    {:ok, room} = AgoraBroker.Room.ensure({8002, 1})
+    {pid, _client} = Enum.find(:sys.get_state(room).sessions, fn {_pid, client} -> client.route["connection_id"] == connection end)
+    log = ExUnit.CaptureLog.capture_log(fn ->
+      send(pid, {:close, :canvas_socket_closed})
+      assert_receive {:gun_ws, ^gun, ^stream, close}, 3_000
+      assert is_tuple(close) and elem(close, 0) == :close
+    end)
+    refute log =~ "terminating"
+    refute log =~ "[error]"
+  end
+
 end

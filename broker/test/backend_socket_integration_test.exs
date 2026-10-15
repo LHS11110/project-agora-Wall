@@ -71,6 +71,19 @@ defmodule AgoraBroker.BackendSocketIntegrationTest do
     :gun.close(gun)
   end
 
+  test "20MB fragmented response keeps the shared query socket alive for subsequent queries", %{pid: pid} do
+    before = :sys.get_state(pid)
+    route = %{"canvas_id" => 1, "connection_id" => "large-test", "request_id" => "large-result"}
+    assert {:ok, result} = GenServer.call(pid, {:request, %{"command" => "test_large_reply", "route" => route}}, 12_000)
+    assert byte_size(result["response"]["data"]) == 20 * 1024 * 1024
+    assert result["route"] == route
+    next = Map.put(route, "request_id", "after-large")
+    assert {:ok, reply} = GenServer.call(pid, {:request, %{"command" => "query", "route" => next, "identity" => %{"canvas_id" => 2}}}, 12_000)
+    assert reply["response"]["code"] == "QUERY_UNAUTHORIZED"
+    assert :sys.get_state(pid).gun == before.gun
+    assert :sys.get_state(pid).pending == %{}
+  end
+
   test "C++ accepts TLS 1.3 and rejects a TLS 1.2-only client" do
     options = [
       verify: :verify_peer,

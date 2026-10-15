@@ -24,7 +24,14 @@ defmodule AgoraBroker.Room do
 
   def join(room, pid, state), do: GenServer.call(room, {:join, pid, state})
   def leave(room, pid), do: GenServer.cast(room, {:leave, pid})
-  def submit(room, pid, event), do: GenServer.call(room, {:event, pid, event}, 2_000)
+
+  def submit(room, pid, event) do
+    GenServer.call(room, {:event, pid, event}, 10_000)
+  catch
+    :exit, {:timeout, _} -> {:error, "QUERY_OUTCOME_UNKNOWN"}
+    :exit, {:noproc, _} -> {:error, "BROKER_BACKEND_UNAVAILABLE"}
+    :exit, _ -> {:error, "QUERY_OUTCOME_UNKNOWN"}
+  end
 
   def control(id, command) do
     for {{_port, canvas}, pid, _} <-
@@ -38,6 +45,7 @@ defmodule AgoraBroker.Room do
   end
 
   def init(key) do
+    Process.send_after(self(), :watermark, 1000)
     Process.send_after(self(), :lease, 30_000)
 
     {:ok,
@@ -46,8 +54,7 @@ defmodule AgoraBroker.Room do
        sessions: %{},
        refs: %{},
        peers: %{},
-       term: Policy.id(),
-       host: "",
+       revision: 0,
        queue: :queue.new(),
        queued_bytes: 0,
        active: nil
@@ -91,8 +98,25 @@ defmodule AgoraBroker.Room do
           |> Map.put("rtc_canvas_connection_id", client.route["connection_id"])
           |> Map.put("rtc_canvas_connection_hash", hash)
 
-    deliver(pid, response)
-    {:reply, :ok, state}
+    if not client.rtc and Map.has_key?(client, :sync_client_id) do
+      # Register first, then serialize the snapshot with mutations. No join gap.
+      event = %{
+        "type" => "canvas_sync",
+        "client_id" => client.sync_client_id,
+        "request_id" => Policy.id()
+      }
+
+      if :queue.len(state.queue) >= @max_queue do
+        send(pid, {:close, :slow_consumer})
+        {:reply, :ok, state}
+      else
+        entry = %{client: client, event: event, bytes: 0, initial: response}
+        {:reply, :ok, dispatch(%{state | queue: :queue.in(entry, state.queue)})}
+      end
+    else
+      deliver(pid, response)
+      {:reply, :ok, state}
+    end
   end
 
   defp handle_event(client, %{"type" => "ping"}, state) do
@@ -112,8 +136,11 @@ defmodule AgoraBroker.Room do
       end)
 
     cond do
-      is_nil(bound) or event["host_protocol"] != 1 ->
+      is_nil(bound) or event["canvas_protocol"] != 2 ->
         {:reply, {:error, "RTC_CANVAS_CONNECTION_INVALID"}, state}
+
+      event["canvas_transport"] != "broker-v1" ->
+        {:reply, {:error, "RTC_CANVAS_TRANSPORT_REQUIRED"}, state}
 
       client.peer_id != nil ->
         {:reply, {:error, "RTC_ALREADY_JOINED"}, state}
@@ -128,7 +155,6 @@ defmodule AgoraBroker.Room do
             | sessions: Map.put(state.sessions, client.pid, client),
               peers: Map.put(state.peers, id, client.pid)
           }
-          |> elect()
 
         list_peers(client, state)
         public = Policy.public(client.identity, id)
@@ -180,33 +206,64 @@ defmodule AgoraBroker.Room do
     end
   end
 
+  # The bound collaboration socket relays canvas data; rtc_signal is reserved
+  # for call negotiation. Sender identity and room membership come from auth.
+  defp handle_event(
+         %{rtc: true, peer_id: id} = client,
+         %{"type" => "canvas_relay", "payload" => payload} = event,
+         state
+       )
+       when is_binary(id) and is_map(payload) do
+    targets = Map.get(event, "peer_ids", Map.keys(state.peers) -- [id])
+    ephemeral = payload["type"] in ["cursor", "laser", "editor_presence"]
+
+    cond do
+      not Map.has_key?(state.sessions, client.bound) or state.peers[id] != client.pid ->
+        {:reply, {:error, "CANVAS_RELAY_UNBOUND"}, state}
+
+      not is_list(targets) or length(targets) > 512 or
+          not Enum.all?(targets, &(is_binary(&1) and &1 != id)) ->
+        {:reply, {:error, "CANVAS_RELAY_TARGET_INVALID"}, state}
+
+      not ephemeral ->
+        {:reply, {:error, "CANVAS_RELAY_TYPE_INVALID"}, state}
+
+      not Enum.all?(targets, &Map.has_key?(state.peers, &1)) ->
+        {:reply, {:error, "CANVAS_RELAY_TARGET_INVALID"}, state}
+
+      ephemeral and byte_size(Jason.encode!(payload)) > 65_536 ->
+        {:reply, {:error, "CANVAS_RELAY_TOO_LARGE"}, state}
+
+      not relay_records_visible?(payload, targets, state) ->
+        {:reply, {:error, "ITEM_ACCESS_DENIED"}, state}
+
+      true ->
+        frame = %{
+          "type" => "canvas_relay",
+          "peer" => Policy.public(client.identity, id),
+          "payload" => payload
+        }
+
+        for target <- Enum.uniq(targets), do: deliver(state.peers[target], frame)
+        {:reply, :ok, state}
+    end
+  end
+
   defp handle_event(%{rtc: true}, _, state), do: {:reply, {:error, "RTC_SIGNAL_INVALID"}, state}
 
   defp handle_event(client, event, state) do
     type = event["type"]
 
-    authorized_host =
-      Enum.any?(state.peers, fn {peer, pid} ->
-        peer == state.host && state.sessions[pid].bound == client.pid
-      end)
-
     cond do
-      type == "host_item_batch" && (not authorized_host or event["host_term"] != state.term) ->
-        {:reply, {:error, "HOST_FENCED"}, state}
-
       type not in [
-        "host_item_batch",
-        "crud",
-        "crud_batch",
+        "canvas_ops",
+        "canvas_sync",
         "chat",
         "chat_history",
         "canvas_settings_get",
         "canvas_settings_update"
       ] ->
         {:reply, {:error, "QUERY_TYPE_INVALID"}, state}
-
-      type in ["crud", "crud_batch"] && event["action"] != "read" && not authorized_host ->
-        {:reply, {:error, "HOST_FENCED"}, state}
 
       true ->
         event =
@@ -230,7 +287,7 @@ defmodule AgoraBroker.Room do
         if :queue.len(state.queue) >= @max_queue or state.queued_bytes + size > @max_bytes do
           {:reply, {:error, "BROKER_BUSY"}, state}
         else
-          entry = %{client: client, event: event, bytes: size, term: state.term}
+          entry = %{client: client, event: event, bytes: size}
 
           state =
             %{
@@ -267,36 +324,48 @@ defmodule AgoraBroker.Room do
     state = %{state | active: nil}
     route = route(entry.client, entry.event)
 
-    case result do
-      {:ok, %{"route" => ^route, "response" => response} = result} ->
-        response =
-          if entry.event["type"] == "host_item_batch" and response["type"] == "error",
-            do: Map.put(response, "type", "host_batch_result"),
-            else: response
+    state =
+      case result do
+        {:ok, %{"route" => ^route, "response" => response} = result} ->
+          response =
+            if Map.has_key?(entry, :initial) and response["type"] == "canvas_snapshot",
+              do: Map.merge(entry.initial, Map.put(response, "type", "init_items")),
+              else: response
 
-        if Map.has_key?(state.sessions, entry.client.pid), do: deliver(entry.client.pid, response)
+          if Map.has_key?(entry, :initial) and response["type"] != "init_items",
+            do: send(entry.client.pid, {:close, :snapshot_failed})
 
-        for broadcast <- result["broadcasts"] || [],
-            {pid, client} <- state.sessions,
-            not client.rtc and
-              (broadcast["all"] == true or
-                 Policy.visible?(client.identity, broadcast["permission"])) do
-          deliver(pid, broadcast["event"])
-          if broadcast["close"], do: send(pid, {:close, :settings_changed})
-        end
+          state_revision =
+            max(state.revision, response["server_revision"] || response["revision"] || 0)
 
-      {:error, code} when is_binary(code) ->
-        deliver(entry.client.pid, request_error(entry.event, code))
+          if Map.has_key?(state.sessions, entry.client.pid),
+            do: deliver(entry.client.pid, response)
 
-      _ ->
-        deliver(entry.client.pid, %{
-          "type" =>
-            if(entry.event["type"] == "host_item_batch", do: "host_batch_result", else: "error"),
-          "ok" => false,
-          "code" => "QUERY_OUTCOME_UNKNOWN",
-          "request_id" => route["request_id"]
-        })
-    end
+          for broadcast <- result["broadcasts"] || [],
+              {pid, client} <- state.sessions,
+              not client.rtc and
+                (broadcast["all"] == true or
+                   Policy.visible?(client.identity, broadcast["permission"])) do
+            deliver(pid, filtered_event(broadcast, client.identity))
+            if broadcast["close"], do: send(pid, {:close, :settings_changed})
+          end
+
+          %{state | revision: state_revision}
+
+        {:error, code} when is_binary(code) ->
+          deliver(entry.client.pid, request_error(entry.event, code))
+          state
+
+        _ ->
+          deliver(entry.client.pid, %{
+            "type" => "error",
+            "ok" => false,
+            "code" => "QUERY_OUTCOME_UNKNOWN",
+            "request_id" => route["request_id"]
+          })
+
+          state
+      end
 
     {:noreply, dispatch(state)}
   end
@@ -306,8 +375,7 @@ defmodule AgoraBroker.Room do
         %{active: %{ref: ref, entry: entry}} = state
       ) do
     deliver(entry.client.pid, %{
-      "type" =>
-        if(entry.event["type"] == "host_item_batch", do: "host_batch_result", else: "error"),
+      "type" => "error",
       "ok" => false,
       "code" => "QUERY_OUTCOME_UNKNOWN",
       "request_id" => entry.event["request_id"]
@@ -323,6 +391,16 @@ defmodule AgoraBroker.Room do
     end
   end
 
+  def handle_info(:watermark, state) do
+    Process.send_after(self(), :watermark, 1000)
+
+    for {pid, client} <- state.sessions,
+        not client.rtc,
+        do: deliver(pid, %{"type" => "canvas_watermark", "revision" => state.revision})
+
+    {:noreply, state}
+  end
+
   def handle_info(:lease, state) do
     Process.send_after(self(), :lease, 30_000)
 
@@ -336,8 +414,7 @@ defmodule AgoraBroker.Room do
         entry = %{
           client: client,
           event: %{"type" => "broker_lease", "request_id" => Policy.id()},
-          bytes: 0,
-          term: state.term
+          bytes: 0
         }
 
         if :queue.len(state.queue) < @max_queue,
@@ -345,6 +422,23 @@ defmodule AgoraBroker.Room do
           else: {:noreply, state}
     end
   end
+
+  defp relay_records_visible?(%{"records" => records}, targets, state) when is_map(records) do
+    Enum.all?(targets, fn target ->
+      identity = state.sessions[state.peers[target]].identity
+
+      Enum.all?(records, fn {_id, record} ->
+        is_map(record) and
+          Policy.visible?(
+            identity,
+            get_in(record, ["item", "permission"]) || record["permission"]
+          )
+      end)
+    end)
+  end
+
+  defp relay_records_visible?(%{"records" => _}, _, _), do: false
+  defp relay_records_visible?(_, _, _), do: true
 
   defp dispatch(%{active: active} = state) when not is_nil(active), do: state
 
@@ -358,16 +452,6 @@ defmodule AgoraBroker.Room do
 
         cond do
           not Map.has_key?(state.sessions, entry.client.pid) ->
-            dispatch(state)
-
-          entry.event["type"] == "host_item_batch" && entry.term != state.term ->
-            deliver(entry.client.pid, %{
-              "type" => "host_batch_result",
-              "ok" => false,
-              "code" => "HOST_FENCED",
-              "request_id" => entry.event["request_id"]
-            })
-
             dispatch(state)
 
           true ->
@@ -405,7 +489,7 @@ defmodule AgoraBroker.Room do
 
   defp request_error(event, code),
     do: %{
-      "type" => if(event["type"] == "host_item_batch", do: "host_batch_result", else: "error"),
+      "type" => "error",
       "ok" => false,
       "code" => code,
       "request_id" => event["request_id"]
@@ -433,23 +517,11 @@ defmodule AgoraBroker.Room do
         for {_id, other} <- state.peers,
             do: deliver(other, %{"type" => "rtc_peer_left", "peer_id" => id})
 
-        elect(state)
+        state
 
       _ ->
         state
     end
-  end
-
-  defp elect(state) do
-    peers =
-      Enum.map(state.peers, fn {id, pid} -> Policy.public(state.sessions[pid].identity, id) end)
-
-    state = %{state | term: Policy.id(), host: Policy.elect(peers)}
-
-    for {_id, pid} <- state.peers,
-        do: deliver(pid, %{"type" => "rtc_host_changed", "host" => host(state)})
-
-    state
   end
 
   defp list_peers(client, state) do
@@ -462,18 +534,42 @@ defmodule AgoraBroker.Room do
       "type" => "rtc_peers",
       "self_peer_id" => client.peer_id,
       "peers" => peers,
-      "host" => host(state)
+      "canvas_protocol" => 2
     })
   end
 
-  defp host(state),
-    do: %{
-      "protocol" => 1,
-      "term" => state.term,
-      "peer_id" => state.host,
-      "members" =>
-        Enum.map(state.peers, fn {id, pid} -> Policy.public(state.sessions[pid].identity, id) end)
-    }
+  defp filtered_event(%{"event" => %{"type" => "canvas_commit"} = event} = broadcast, identity) do
+    permissions = broadcast["permissions"] || %{}
+    previous = broadcast["previous_permissions"] || %{}
+
+    if Map.has_key?(event, "translations") do
+      translations =
+        for move <- event["translations"],
+            ids = Enum.filter(move["ids"], &Policy.visible?(identity, permissions[&1])),
+            ids != [],
+            do: Map.put(move, "ids", ids)
+
+      Map.put(event, "translations", translations)
+    else
+      items =
+        Enum.reduce(event["items"] || %{}, %{}, fn {id, item}, result ->
+          cond do
+            not is_nil(item) and Policy.visible?(identity, permissions[id]) ->
+              Map.put(result, id, item)
+
+            Policy.visible?(identity, previous[id]) ->
+              Map.put(result, id, nil)
+
+            true ->
+              result
+          end
+        end)
+
+      Map.put(event, "items", items)
+    end
+  end
+
+  defp filtered_event(broadcast, _identity), do: broadcast["event"]
 
   defp route(client, event), do: Map.put(client.route, "request_id", event["request_id"])
   defp valid_id(id) when is_binary(id) and byte_size(id) in 1..128, do: id

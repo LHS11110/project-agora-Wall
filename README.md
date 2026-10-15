@@ -148,3 +148,18 @@ Phoenix의 WebSocket `connect` 단계에서 JOSE로 HS256 서명·만료·nbf/ia
 Spring·C++의 MS SQL·Elasticsearch·Redis/Sentinel 연결은 Wall의 TCP 저장소 브로커를 경유합니다. 애플리케이션과 저장소 네트워크를 분리하고 기존 TLS 스트림 및 인증서 검증을 유지합니다. [설정·연결 경로·전환·검증](STORAGE_BROKER.md)을 참고하세요.
 
 내부 Nginx `/internal/search/embedding`은 Spring의 검색어를 BE 자체 호스팅 E5 worker로 전달합니다. 외부 `/internal` 차단 및 내부 토큰 검증을 유지하고 TLS 1.3·Spring 인증서 이름을 검증합니다. 문서 projection은 기존 storage-broker 경유 ES 연결을 사용합니다. [검색 아키텍처](../project-agora-DB/elasticsearch/SEARCH.md).
+
+## 외부 리버스 프록시 연결
+
+호스트 Nginx 등 외부 프록시를 거치면 Wall `.env`의 `NGINX_TRUSTED_PROXY_IP`에 Docker 게이트웨이에서 관찰되는 해당 프록시의 정확한 IP를 설정합니다. 외부 프록시는 `X-Real-IP`를 실제 접속자 IP로 덮어써야 합니다. Wall은 이 신뢰된 주소에서 온 헤더만 사용하며, Spring과 WebSocket 브로커가 동일한 IP로 토큰을 검증합니다. 전체 사설 네트워크를 신뢰하도록 설정하지 마세요. 변경 후 Orchestra의 `scripts/start-deploy.sh`로 적용합니다.
+
+### Canvas collaboration routing
+
+객체 변경은 캔버스 데이터 WebSocket의 `canvas_ops`로 C++ 서버에 전달하고 Redis에 반영합니다.
+브로커는 `canvas_result`와 권한에 맞는 `canvas_commit`을 전달하며 각 브라우저가 렌더링합니다.
+브라우저 호스트 선출이나 승인은 없습니다. `client_id`·요청 카운터·저장 기록으로 재전송 중복을 막고,
+새 참여자 및 재접속자는 순번과 처리 카운터가 포함된 서버 스냅샷을 받습니다.
+
+RTC 가입은 `canvas_protocol: 2`, `canvas_transport: "broker-v1"`과 데이터 소켓의 연결 증명을 사용합니다.
+`canvas_relay`는 커서·레이저·편집 상태 전용이며, P2P는 통화 미디어에만 사용합니다.
+이전 탭은 새로고침해야 합니다. [상세 프로토콜](BROKER_PROTOCOL.md).

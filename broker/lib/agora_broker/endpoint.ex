@@ -5,7 +5,7 @@ defmodule AgoraBroker.Endpoint do
     websocket: [
       connect_info: [:peer_data, :x_headers],
       timeout: 60_000,
-      max_frame_size: 12_582_912,
+      max_frame_size: 16_777_216,
       compress: false
     ],
     longpoll: false

@@ -16,6 +16,8 @@ defmodule AgoraBroker.Socket do
       with {:ok, principal, expiry} <- Auth.verify(token, id, client_ip, port) do
         case backend.connect(%{
                "principal" => principal,
+               "include_items" => false,
+               "client_id" => params["client_id"] || "",
                "ws_port" => port,
                "client_ip" => client_ip,
                "route" => route
@@ -38,6 +40,7 @@ defmodule AgoraBroker.Socket do
                      "expires_at" => expiry
                    }),
                  response: response,
+                 sync_client_id: params["client_id"] || Policy.id(),
                  expiry: expiry,
                  rtc: params["rtc"] == "true",
                  room: nil,
@@ -88,6 +91,7 @@ defmodule AgoraBroker.Socket do
     {:ok, room} = Room.ensure({state.ws_port, state.route["canvas_id"]})
     Process.monitor(room)
     :ok = Room.join(room, self(), state)
+    Process.send_after(self(), :heartbeat, 20_000)
 
     Process.send_after(
       self(),
@@ -98,7 +102,7 @@ defmodule AgoraBroker.Socket do
     {:ok, %{state | room: room}}
   end
 
-  def handle_in({text, opts}, state) when is_binary(text) and byte_size(text) <= 12_582_912 do
+  def handle_in({text, opts}, state) when is_binary(text) and byte_size(text) <= 16_777_216 do
     second = System.monotonic_time(:second)
     count = if second == state.rate_second, do: state.rate_count + 1, else: 1
     state = %{state | rate_second: second, rate_count: count}
@@ -108,10 +112,16 @@ defmodule AgoraBroker.Socket do
         reply(%{"type" => "error", "code" => "UNSUPPORTED_FRAME"}, state)
 
       System.system_time(:second) >= state.expiry ->
-        {:stop, :expired, state}
+        {:stop, {:shutdown, :expired}, state}
 
-      count > 100 ->
-        reply(%{"type" => "error", "code" => "RATE_LIMITED"}, state)
+      count > 240 ->
+        event =
+          case Jason.decode(text) do
+            {:ok, event} when is_map(event) -> event
+            _ -> %{}
+          end
+
+        reply(error_payload(event, "RATE_LIMITED"), state)
 
       true ->
         case Jason.decode(text) do
@@ -121,19 +131,7 @@ defmodule AgoraBroker.Socket do
                 {:ok, state}
 
               {:error, code} ->
-                reply(
-                  %{
-                    "type" =>
-                      if(event["type"] == "host_item_batch",
-                        do: "host_batch_result",
-                        else: "error"
-                      ),
-                    "ok" => false,
-                    "code" => code,
-                    "request_id" => event["request_id"]
-                  },
-                  state
-                )
+                reply(error_payload(event, code), state)
             end
 
           _ ->
@@ -144,7 +142,17 @@ defmodule AgoraBroker.Socket do
 
   def handle_in(_, state), do: reply(%{"type" => "error", "code" => "UNSUPPORTED_FRAME"}, state)
   def handle_info({:deliver, payload}, state), do: {:push, {:text, Jason.encode!(payload)}, state}
+
+  def handle_info({:close, reason}, state)
+      when reason in [:expired, :canvas_socket_closed, :settings_changed, :revoked, :room_restart],
+      do: {:stop, {:shutdown, reason}, state}
+
   def handle_info({:close, reason}, state), do: {:stop, reason, state}
+
+  def handle_info(:heartbeat, state) do
+    Process.send_after(self(), :heartbeat, 20_000)
+    {:push, {:ping, ""}, state}
+  end
 
   def handle_info(:expired, state) do
     send(self(), {:close, :expired})
@@ -175,6 +183,30 @@ defmodule AgoraBroker.Socket do
   def terminate(_reason, state) do
     if is_pid(state.room) and Process.alive?(state.room), do: Room.leave(state.room, self())
     :ok
+  end
+
+  defp error_payload(event, code) do
+    result = %{
+      "type" => if(event["type"] == "host_item_batch", do: "host_batch_result", else: "error"),
+      "ok" => false,
+      "code" => code,
+      "request_id" => event["request_id"]
+    }
+
+    case event do
+      %{"type" => "canvas_relay", "payload" => payload} when is_map(payload) ->
+        Enum.reduce([{"term", "relay_term"}, {"type", "relay_type"}], result, fn {source, target},
+                                                                                 acc ->
+          value = payload[source]
+
+          if is_binary(value) and byte_size(value) <= 128,
+            do: Map.put(acc, target, value),
+            else: acc
+        end)
+
+      _ ->
+        result
+    end
   end
 
   defp reply(payload, state), do: {:reply, :ok, {:text, Jason.encode!(payload)}, state}

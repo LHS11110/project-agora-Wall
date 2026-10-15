@@ -11,7 +11,7 @@ case "$command_name" in
     docker info >/dev/null 2>&1 || { echo 'Docker engine is unavailable or access is denied' >&2; exit 1; }
     compose config --quiet
     if [ "$command_name" = production ]; then
-      compose run --rm --no-deps --entrypoint sh nginx -c 'test -f /usr/share/nginx/html/current/index.html' \
+      docker run --rm --network none --mount type=volume,src=agora-frontend-dist,dst=/frontend,readonly nginx:stable-alpine sh -c 'test -f /frontend/current/index.html' \
         || { echo 'Frontend build is missing. Export the FE build first.' >&2; exit 1; }
     fi
     compose up -d --wait --wait-timeout 60

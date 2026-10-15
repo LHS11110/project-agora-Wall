@@ -41,6 +41,9 @@ defmodule AgoraBroker.BackendSocket do
     payload = Jason.encode!(input)
 
     cond do
+      input["command"] == "connect" and Enum.count(state.pending, fn {_, entry} -> entry.command == "connect" end) >= 2 ->
+        {:reply, {:error, "BROKER_BUSY"}, state}
+
       Map.has_key?(state.pending, id) ->
         {:reply, {:error, "QUERY_ALREADY_PENDING"}, state}
 
@@ -49,13 +52,14 @@ defmodule AgoraBroker.BackendSocket do
 
       true ->
         :ok = :gun.ws_send(state.gun, state.stream, {:text, payload})
-        timer = Process.send_after(self(), {:timeout, id}, 10_000)
+        timer = Process.send_after(self(), {:timeout, id}, if(input["command"] == "connect", do: 40_000, else: 10_000))
 
         pending =
           Map.put(state.pending, id, %{
             from: from,
             route: input["route"],
             timer: timer,
+            command: input["command"],
             bytes: byte_size(payload)
           })
 
@@ -63,6 +67,7 @@ defmodule AgoraBroker.BackendSocket do
     end
   end
 
+  def handle_call({:request, _}, _, %{ready: true} = state), do: {:reply, {:error, "BROKER_BUSY"}, state}
   def handle_call({:request, _}, _, state),
     do: {:reply, {:error, "BROKER_BACKEND_UNAVAILABLE"}, state}
 
@@ -73,7 +78,7 @@ defmodule AgoraBroker.BackendSocket do
       :gun.ws_upgrade(gun, "/broker/queries", [{"x-agora-internal-token", token}], %{
         compress: false,
         keepalive: 20_000,
-        max_frame_size: 16 * 1024 * 1024
+        max_frame_size: 128 * 1024 * 1024
       })
 
     {:noreply, %{state | stream: stream, ready: false}}
@@ -86,7 +91,7 @@ defmodule AgoraBroker.BackendSocket do
       do: {:noreply, %{state | ready: true}}
 
   def handle_info({:gun_ws, gun, stream, {:text, text}}, %{gun: gun, stream: stream} = state)
-      when byte_size(text) <= 16 * 1024 * 1024 do
+      when byte_size(text) <= 128 * 1024 * 1024 do
     case Jason.decode(text) do
       {:ok, %{"route" => route} = result} ->
         id = {route["connection_id"], route["request_id"]}
