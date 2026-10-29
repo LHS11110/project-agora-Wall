@@ -75,3 +75,41 @@ RTC는 `canvas_protocol: 2`, `canvas_transport: "broker-v1"` 및 캔버스 소�
 `rtc_signal`은 통화 연결 협상 전용입니다. 이전 버전 탭은 한 번 새로고침해야 합니다.
 
 인증 만료·캔버스 소켓 종료·설정 변경 등 예상된 소켓 종료는 이유를 보존한 shutdown으로 처리하며 비정상 GenServer 오류로 기록하지 않습니다.
+
+## 저장 결과 유실과 접속 순서
+
+게이트웨이는 외부 WebSocket의 `client_id`를 내부 `/broker/websocket` 쿼리에도 전달합니다.
+이 값이 없으면 임의의 ID로 첫 스냅샷을 읽어 기존 편집 세션의 처리 내역을 찾지 못합니다.
+
+`canvas_ops`는 발신자 퇴장 후에도 큐에서 실행합니다. 일시 실패·결과 불명 시 동일 요청을
+1초 후 재시도하고 인증 만료·영구 거절 시 중단합니다. 대기 중인 동일 사용자·클라이언트·카운터의
+동일 요청은 합치며, 내용이 다르면 `CLIENT_REQUEST_MISMATCH`로 거절합니다.
+재시도 중에도 한 캔버스의 직렬 처리를 유지하므로 새 참여자의 스냅샷이 미확정 저장을 추월하지 않습니다.
+저장 성공 이후 확정 변경을 방송하며, 중복 저장 응답의 최신 순번 안내로 누락된 방송을 복구합니다.
+재시도 후 결과를 확정하지 못하면 `canvas_watermark`에 `force_sync: true`를 넣어
+같은 순번에서도 재동기화하게 합니다. 브로커 메모리 큐는 프로세스 재시작을 견디는 영속 로그가 아닙니다.
+
+## Server-owned mentions and object comments
+
+`chat` and `chat_history` accept an optional `object_id`. The C++ server derives the
+private comment room and checks the current object's ACL on every request. A direct
+request to an `object-comment-*` room without its object ID is rejected. Comments
+use the same durable chat sequence/history path as canvas chat.
+
+`mentions_get` returns `mentions_snapshot` with the current authenticated user's
+latest 100 accessible unread notifications. `mention_read` accepts only `mention_id`
+and returns a confirmation after persistence. Client-supplied user IDs are ignored.
+Each stored message contains a per-recipient `mentions` boolean map; the server also
+maintains a private `mention-states` index. Message append, retry receipt and mention
+index creation happen atomically. Read acknowledgements update the message and index
+atomically and do not reset unread state on duplicate message retries.
+
+Server broadcasts may contain `user_ids`. These are delivered only to matching
+session user IDs, including when another session has administrator privileges.
+`mentions_changed` carries no notification text and instructs matching clients to
+refresh their server-owned notification list. Reconnect performs the same query.
+
+Blueprint execution and output nodes are shapes with `runtimeRole: executor|output`.
+Only output nodes may carry bounded `runtimeResults` arrays. Execution follows
+ordinary directed canvas connectors. Outputs are persisted and broadcast through
+normal server-authoritative `canvas_ops`; code nodes do not independently execute.

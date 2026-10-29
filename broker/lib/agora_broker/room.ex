@@ -3,6 +3,7 @@ defmodule AgoraBroker.Room do
   alias AgoraBroker.Policy
   @max_queue 128
   @max_bytes 16 * 1024 * 1024
+  @retryable_save_errors ~w(BROKER_BUSY BROKER_BACKEND_UNAVAILABLE BROKER_QUEUE_FULL RATE_LIMITED QUERY_OUTCOME_UNKNOWN QUERY_UNAVAILABLE STORAGE_UNAVAILABLE CANVAS_WRITE_CONFLICT)
   def start_link(key),
     do:
       GenServer.start_link(__MODULE__, key,
@@ -260,6 +261,8 @@ defmodule AgoraBroker.Room do
         "canvas_sync",
         "chat",
         "chat_history",
+        "mentions_get",
+        "mention_read",
         "canvas_settings_get",
         "canvas_settings_update"
       ] ->
@@ -284,20 +287,30 @@ defmodule AgoraBroker.Room do
         event = Map.put(event, "request_id", valid_id(event["request_id"]))
         size = byte_size(Jason.encode!(event))
 
-        if :queue.len(state.queue) >= @max_queue or state.queued_bytes + size > @max_bytes do
-          {:reply, {:error, "BROKER_BUSY"}, state}
-        else
-          entry = %{client: client, event: event, bytes: size}
+        pending = pending_save(state, client, event)
 
-          state =
-            %{
-              state
-              | queue: :queue.in(entry, state.queue),
-                queued_bytes: state.queued_bytes + size
-            }
-            |> dispatch()
+        cond do
+          pending == :same ->
+            {:reply, :ok, state}
 
-          {:reply, :ok, state}
+          pending == :mismatch ->
+            {:reply, {:error, "CLIENT_REQUEST_MISMATCH"}, state}
+
+          :queue.len(state.queue) >= @max_queue or state.queued_bytes + size > @max_bytes ->
+            {:reply, {:error, "BROKER_BUSY"}, state}
+
+          true ->
+            entry = %{client: client, event: event, bytes: size}
+
+            state =
+              %{
+                state
+                | queue: :queue.in(entry, state.queue),
+                  queued_bytes: state.queued_bytes + size
+              }
+              |> dispatch()
+
+            {:reply, :ok, state}
         end
     end
   end
@@ -327,44 +340,43 @@ defmodule AgoraBroker.Room do
     state =
       case result do
         {:ok, %{"route" => ^route, "response" => response} = result} ->
-          response =
-            if Map.has_key?(entry, :initial) and response["type"] == "canvas_snapshot",
-              do: Map.merge(entry.initial, Map.put(response, "type", "init_items")),
-              else: response
+          if retry_save?(entry, response["code"]) and response["ok"] != true do
+            defer_save(entry, response["code"], state)
+          else
+            response =
+              if Map.has_key?(entry, :initial) and response["type"] == "canvas_snapshot",
+                do: Map.merge(entry.initial, Map.put(response, "type", "init_items")),
+                else: response
 
-          if Map.has_key?(entry, :initial) and response["type"] != "init_items",
-            do: send(entry.client.pid, {:close, :snapshot_failed})
+            if Map.has_key?(entry, :initial) and response["type"] != "init_items",
+              do: send(entry.client.pid, {:close, :snapshot_failed})
 
-          state_revision =
-            max(state.revision, response["server_revision"] || response["revision"] || 0)
+            state_revision =
+              max(state.revision, response["server_revision"] || response["revision"] || 0)
 
-          if Map.has_key?(state.sessions, entry.client.pid),
-            do: deliver(entry.client.pid, response)
+            if Map.has_key?(state.sessions, entry.client.pid),
+              do: deliver(entry.client.pid, response)
 
-          for broadcast <- result["broadcasts"] || [],
-              {pid, client} <- state.sessions,
-              not client.rtc and
-                (broadcast["all"] == true or
-                   Policy.visible?(client.identity, broadcast["permission"])) do
-            deliver(pid, filtered_event(broadcast, client.identity))
-            if broadcast["close"], do: send(pid, {:close, :settings_changed})
+            for broadcast <- result["broadcasts"] || [],
+                {pid, client} <- state.sessions,
+                not client.rtc and
+                  Policy.receives?(client.identity, broadcast) do
+              deliver(pid, filtered_event(broadcast, client.identity))
+              if broadcast["close"], do: send(pid, {:close, :settings_changed})
+            end
+
+            if entry.event["type"] == "canvas_ops" and Map.get(entry, :attempts, 0) > 0 and
+                 response["ok"] != true,
+               do: force_sync(state)
+
+            %{state | revision: state_revision}
           end
 
-          %{state | revision: state_revision}
-
         {:error, code} when is_binary(code) ->
-          deliver(entry.client.pid, request_error(entry.event, code))
-          state
+          failed_query(entry, code, state)
 
         _ ->
-          deliver(entry.client.pid, %{
-            "type" => "error",
-            "ok" => false,
-            "code" => "QUERY_OUTCOME_UNKNOWN",
-            "request_id" => route["request_id"]
-          })
-
-          state
+          failed_query(entry, "QUERY_OUTCOME_UNKNOWN", state)
       end
 
     {:noreply, dispatch(state)}
@@ -374,15 +386,22 @@ defmodule AgoraBroker.Room do
         {:DOWN, ref, :process, _pid, _reason},
         %{active: %{ref: ref, entry: entry}} = state
       ) do
-    deliver(entry.client.pid, %{
-      "type" => "error",
-      "ok" => false,
-      "code" => "QUERY_OUTCOME_UNKNOWN",
-      "request_id" => entry.event["request_id"]
-    })
-
-    {:noreply, dispatch(%{state | active: nil})}
+    {:noreply, dispatch(failed_query(entry, "QUERY_OUTCOME_UNKNOWN", %{state | active: nil}))}
   end
+
+  def handle_info({:retry_save, token}, %{active: %{retry: token, entry: entry}} = state) do
+    state = %{state | active: nil}
+
+    if save_identity_valid?(entry) do
+      {:noreply, start_entry(entry, state)}
+    else
+      force_sync(state)
+      deliver(entry.client.pid, request_error(entry.event, "QUERY_UNAUTHORIZED"))
+      {:noreply, dispatch(state)}
+    end
+  end
+
+  def handle_info({:retry_save, _}, state), do: {:noreply, state}
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     case Map.pop(state.refs, ref) do
@@ -451,38 +470,108 @@ defmodule AgoraBroker.Room do
         state = %{state | queue: rest, queued_bytes: state.queued_bytes - entry.bytes}
 
         cond do
-          not Map.has_key?(state.sessions, entry.client.pid) ->
+          not Map.has_key?(state.sessions, entry.client.pid) and
+              entry.event["type"] != "canvas_ops" ->
             dispatch(state)
 
           true ->
-            backend = Application.get_env(:agora_broker, :backend, AgoraBroker.Backend)
-
-            task =
-              try do
-                {:ok,
-                 Task.Supervisor.async_nolink(AgoraBroker.Tasks, fn ->
-                   backend.query(%{
-                     "route" => route(entry.client, entry.event),
-                     "identity" => entry.client.identity,
-                     "ws_port" => entry.client.ws_port,
-                     "event" => entry.event
-                   })
-                 end)}
-              rescue
-                RuntimeError -> {:error, "BROKER_BUSY"}
-              end
-
-            case task do
-              {:ok, task} ->
-                %{state | active: %{ref: task.ref, entry: entry}}
-
-              {:error, code} ->
-                deliver(entry.client.pid, request_error(entry.event, code))
-                dispatch(state)
-            end
+            start_entry(entry, state)
         end
     end
   end
+
+  defp start_entry(entry, state) do
+    backend = Application.get_env(:agora_broker, :backend, AgoraBroker.Backend)
+
+    task =
+      try do
+        {:ok,
+         Task.Supervisor.async_nolink(AgoraBroker.Tasks, fn ->
+           backend.query(%{
+             "route" => route(entry.client, entry.event),
+             "identity" => entry.client.identity,
+             "ws_port" => entry.client.ws_port,
+             "event" => entry.event
+           })
+         end)}
+      rescue
+        RuntimeError -> {:error, "BROKER_BUSY"}
+      end
+
+    case task do
+      {:ok, task} -> %{state | active: %{ref: task.ref, entry: entry}}
+      {:error, code} -> dispatch(failed_query(entry, code, state))
+    end
+  end
+
+  defp save_identity_valid?(entry),
+    do:
+      Map.get(entry.client.identity, "expires_at", System.system_time(:second) + 1) >
+        System.system_time(:second)
+
+  defp retry_save?(entry, code),
+    do:
+      entry.event["type"] == "canvas_ops" and code in @retryable_save_errors and
+        save_identity_valid?(entry)
+
+  defp defer_save(entry, code, state) do
+    deliver(entry.client.pid, request_error(entry.event, code))
+    token = make_ref()
+    Process.send_after(self(), {:retry_save, token}, 1000)
+
+    %{
+      state
+      | active: %{ref: nil, entry: Map.update(entry, :attempts, 1, &(&1 + 1)), retry: token}
+    }
+  end
+
+  defp failed_query(entry, code, state) do
+    if retry_save?(entry, code) do
+      defer_save(entry, code, state)
+    else
+      deliver(entry.client.pid, request_error(entry.event, code))
+
+      if entry.event["type"] == "canvas_ops" and Map.get(entry, :attempts, 0) > 0,
+        do: force_sync(state)
+
+      state
+    end
+  end
+
+  defp force_sync(state) do
+    for {pid, client} <- state.sessions,
+        not client.rtc,
+        do:
+          deliver(pid, %{
+            "type" => "canvas_watermark",
+            "revision" => state.revision,
+            "force_sync" => true
+          })
+  end
+
+  defp pending_save(
+         state,
+         client,
+         %{"type" => "canvas_ops", "client_id" => id, "request_count" => count} = event
+       )
+       when is_binary(id) and is_integer(count) do
+    entries = if(state.active, do: [state.active.entry], else: []) ++ :queue.to_list(state.queue)
+
+    match =
+      Enum.find(entries, fn entry ->
+        entry.event["type"] == "canvas_ops" and
+          entry.client.identity["user_id"] == client.identity["user_id"] and
+          entry.event["client_id"] == id and entry.event["request_count"] == count
+      end)
+
+    cond do
+      is_nil(match) -> nil
+      match.event == event -> :same
+      true -> :mismatch
+    end
+  end
+
+  defp pending_save(_, _, _), do: nil
 
   def format_status(status),
     do: Map.update(status, :state, %{}, &Map.drop(&1, [:sessions, :queue, :active]))

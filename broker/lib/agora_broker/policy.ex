@@ -8,6 +8,11 @@ defmodule AgoraBroker.Policy do
     identity["is_admin"] == true or Enum.any?(groups(permission), &(&1 in identity["groups"]))
   end
 
+  def receives?(identity, %{"user_ids" => users}) when is_list(users),
+    do: identity["user_id"] in users
+  def receives?(identity, broadcast),
+    do: broadcast["all"] == true or visible?(identity, broadcast["permission"])
+
   def elect(peers) do
     groups = peers |> Enum.flat_map(& &1["groups"]) |> Enum.uniq()
 
