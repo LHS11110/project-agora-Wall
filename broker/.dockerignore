@@ -1,5 +1,15 @@
+.git
+.env
+.env.*
+.envrc*
 _build
 deps
-.git
 .elixir_ls
 erl_crash.dump
+*.pem
+*.key
+*.p12
+*.pfx
+client_secret*.json
+service-account*.json
+application_default_credentials.json

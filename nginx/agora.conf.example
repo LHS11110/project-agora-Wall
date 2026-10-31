@@ -31,6 +31,16 @@ map $host $agora_hsts {
     127.0.0.1 "max-age=0";
 }
 
+# Preserve the public port only from the explicitly trusted outer TLS proxy.
+geo $realip_remote_addr $agora_trusted_edge {
+    default 0;
+    ${NGINX_TRUSTED_PROXY_IP} 1;
+}
+map "$agora_trusted_edge:$http_x_forwarded_port" $agora_public_port {
+    default ${NGINX_HTTPS_PORT};
+    "~^1:(?<agora_edge_port>[1-9][0-9]{0,4})$" $agora_edge_port;
+}
+
 server {
     server_tokens off;
     listen 443 ssl;
@@ -79,7 +89,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Port ${NGINX_HTTPS_PORT};
+        proxy_set_header X-Forwarded-Port $agora_public_port;
     }
 
     location /api/ {
@@ -91,7 +101,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Port ${NGINX_HTTPS_PORT};
+        proxy_set_header X-Forwarded-Port $agora_public_port;
     }
 
     # Logical C++ route ports are resolved by the broker allowlist.
@@ -176,7 +186,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Forwarded-Port ${NGINX_HTTPS_PORT};
+        proxy_set_header X-Forwarded-Port $agora_public_port;
         proxy_read_timeout 86400s;
     }
 }
