@@ -34,11 +34,11 @@ defmodule AgoraBroker.Socket do
                  route: route,
                  ws_port: port,
                  identity:
-                   Map.merge(identity, %{
+                   Policy.compile(Map.merge(identity, %{
                      "canvas_id" => id,
                      "connection_id" => route["connection_id"],
                      "expires_at" => expiry
-                   }),
+                   })),
                  response: response,
                  sync_client_id: params["client_id"] || Policy.id(),
                  expiry: expiry,

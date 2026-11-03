@@ -103,6 +103,18 @@ defmodule AgoraBroker.RoomTest do
     end
   end
 
+  test "compiled bit masks stay internal while authenticated layout reaches C++", %{room: room, canvas: canvas} do
+    base=client(false,canvas)
+    identity=base.identity |> Map.put("group_bits",%{"group"=>63}) |> Policy.compile()
+    :ok=Room.join(room,self(),%{base|identity: identity})
+    assert_receive {:deliver,%{"type"=>"init_items"}}
+    :ok=Room.submit(room,self(),%{"type"=>"canvas_ops","request_id"=>"bit-cache"})
+    assert_receive {:query,input}
+    assert input["identity"]["group_bits"]["group"]==63
+    refute Map.has_key?(input["identity"],"_group_index")
+    refute Map.has_key?(input["identity"],"_read_mask")
+  end
+
   test "a data socket can submit edits without any RTC peers or host", %{
     room: room,
     canvas: canvas

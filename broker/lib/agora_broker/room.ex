@@ -489,7 +489,7 @@ defmodule AgoraBroker.Room do
          Task.Supervisor.async_nolink(AgoraBroker.Tasks, fn ->
            backend.query(%{
              "route" => route(entry.client, entry.event),
-             "identity" => entry.client.identity,
+             "identity" => Map.drop(entry.client.identity, ["_group_index", "_read_mask"]),
              "ws_port" => entry.client.ws_port,
              "event" => entry.event
            })
