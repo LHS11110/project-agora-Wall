@@ -34,12 +34,32 @@ defmodule AgoraBroker.ServerSyncBackend do
         },
         else: %{"type" => "canvas_result", "ok" => true, "revision" => 1, "server_revision" => 1}
 
-    {:ok,
-     %{
-       "route" => input["route"],
-       "response" => Map.put(response, "request_id", input["route"]["request_id"]),
-       "broadcasts" => event["test_broadcasts"] || []
-     }}
+    result = %{
+      "route" => input["route"],
+      "response" => Map.put(response, "request_id", input["route"]["request_id"]),
+      "broadcasts" => event["test_broadcasts"] || []
+    }
+    result = cond do
+      event["type"] == "canvas_access_refresh" ->
+        transient = case Application.get_env(:agora_broker, :refresh_error_once) do
+          nil -> false
+          pid -> Agent.get_and_update(pid, fn n -> {n == 0, n + 1} end)
+        end
+        if transient do
+          Map.put(result, "response", %{"type" => "error", "code" => "SETTINGS_STORAGE_ERROR"})
+        else
+        if input["identity"]["user_id"] == 9 do
+          Map.put(result, "response", %{"type" => "error", "code" => "CANVAS_ACCESS_UNAUTHORIZED"})
+        else
+          identity = input["identity"] |> Map.put("groups", ["new"]) |> Map.put("write_groups", []) |> Map.put("settings_revision", 2)
+          result |> Map.put("identity", identity) |> Map.put("response", %{"settings" => %{"settings_revision" => 2, "canvas_name" => "Renamed", "can_manage" => false}})
+        end
+        end
+      event["test_refresh"] ->
+        result |> Map.put("refresh_sessions", true) |> Map.put("refresh_items", event["test_refresh_items"] == true) |> Map.put("response", %{"type" => "canvas_settings_result", "ok" => true, "settings" => %{"settings_revision" => 2}})
+      true -> result
+    end
+    {:ok, result}
   catch
     :transient_failure -> {:error, "QUERY_OUTCOME_UNKNOWN"}
   end
@@ -115,6 +135,68 @@ defmodule AgoraBroker.RoomTest do
     refute Map.has_key?(input["identity"],"_read_mask")
   end
 
+  test "ordinary settings keep ACL and objects intact while queued requests use new revision", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    :ok = Room.submit(room, self(), %{"type" => "canvas_settings_update", "request_id" => "settings", "test_refresh" => true})
+    :ok = Room.submit(room, self(), %{"type" => "canvas_ops", "request_id" => "queued"})
+    assert_receive {:deliver, %{"type" => "canvas_settings_result"}}
+    assert_receive {:deliver, %{"type" => "canvas_settings_changed", "settings" => %{"settings_revision" => 2, "can_manage" => false}}}
+    assert_receive {:query, %{"event" => %{"request_id" => "queued"}, "identity" => %{"settings_revision" => 2, "groups" => ["group"]}}}
+    refute_receive {:query, %{"event" => %{"type" => "canvas_access_refresh"}}}, 50
+    refute_receive {:close, _}, 50
+    refute_receive {:deliver, %{"type" => "server_reconnect"}}, 50
+    refute_receive {:deliver, %{"force_sync" => true}}, 50
+    assert :sys.get_state(room).refresh_pending == 0
+  end
+
+  test "ACL settings refresh visible objects and revoke only removed participant", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    guest = client(false, canvas) |> put_in([:identity, "user_id"], 9)
+    pid = listener(room, guest)
+    assert_receive {:frame, ^pid, %{"type" => "init_items"}}
+    :ok = Room.submit(room, self(), %{"type" => "canvas_settings_update", "request_id" => "roles", "test_refresh" => true, "test_refresh_items" => true})
+    assert_receive {:deliver, %{"type" => "canvas_access_changed"}}
+    assert_receive {:deliver, %{"type" => "canvas_watermark", "force_sync" => true}}
+    assert_receive {:frame, ^pid, %{"type" => "canvas_access_revoked"}}
+    refute_receive {:close, _}, 50
+    state = :sys.get_state(room)
+    assert Map.has_key?(state.sessions, self())
+    refute Map.has_key?(state.sessions, pid)
+    assert state.refresh_pending == 0
+    send(pid, :stop)
+  end
+
+  test "RTC peer and proof survive live settings and late join receives current ACL", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"rtc_canvas_connection_id" => connection, "rtc_canvas_connection_hash" => proof}}
+    rtc = listener(room, client(true, canvas))
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_ready"}}
+    :ok = Room.submit(room, rtc, %{"type" => "rtc_join", "canvas_protocol" => 2, "canvas_transport" => "broker-v1", "canvas_connection_id" => connection, "canvas_connection_hash" => proof})
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_peers", "self_peer_id" => peer}}
+    :ok = Room.submit(room, self(), %{"type" => "canvas_settings_update", "request_id" => "rtc-settings", "test_refresh" => true, "test_refresh_items" => true})
+    assert_receive {:deliver, %{"type" => "canvas_access_changed"}}
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_peers", "self_peer_id" => ^peer}}
+    assert :sys.get_state(room).sessions[rtc].identity["groups"] == ["new"]
+    assert :sys.get_state(room).sessions[self()].proof == proof
+    late = client(false, canvas) |> Map.put(:sync_client_id, "late")
+    pid = listener(room, late)
+    assert_receive {:frame, ^pid, %{"type" => "init_items", "groups" => ["new"], "write_groups" => []}}
+    refute_receive {:close, _}, 50
+    send(rtc, :stop);send(pid, :stop)
+  end
+
+  test "temporary settings storage failure retries refresh without disconnecting", %{room: room, canvas: canvas} do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+    Application.put_env(:agora_broker, :refresh_error_once, counter)
+    on_exit(fn -> Application.delete_env(:agora_broker, :refresh_error_once) end)
+    :ok = Room.join(room, self(), client(false, canvas))
+    :ok = Room.submit(room, self(), %{"type" => "canvas_settings_update", "request_id" => "retry-acl", "test_refresh" => true, "test_refresh_items" => true})
+    assert_receive {:deliver, %{"type" => "canvas_access_changed"}}, 2500
+    assert :sys.get_state(room).refresh_pending == 0
+    refute_receive {:close, _}, 50
+  end
+
   test "a data socket can submit edits without any RTC peers or host", %{
     room: room,
     canvas: canvas
@@ -145,6 +227,7 @@ defmodule AgoraBroker.RoomTest do
              Room.submit(room, self(), %{"type" => "host_item_batch"})
 
     assert {:error, "QUERY_TYPE_INVALID"} = Room.submit(room, self(), %{"type" => "crud_batch"})
+    assert {:error, "QUERY_TYPE_INVALID"} = Room.submit(room, self(), %{"type" => "canvas_access_refresh"})
   end
 
   test "registered sockets receive a serialized fresh snapshot", %{room: room, canvas: canvas} do

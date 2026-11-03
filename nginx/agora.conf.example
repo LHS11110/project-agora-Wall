@@ -79,8 +79,12 @@ server {
     location /internal/ { return 404; }
 
     # Dependency downloads have their own timeout; normal code remains bounded.
-    location ~ ^/api/canvases/[1-9][0-9]*/runtime/java/dependencies$ {
+    location ~ ^/api/canvases/[1-9][0-9]*/runtime/(?:java/dependencies|build|execute/stream)$ {
         proxy_read_timeout 240s;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_cache off;
+        gzip off;
         proxy_hide_header Strict-Transport-Security;
         set $spring_host agora-spring;
         proxy_ssl_name agora-spring;
