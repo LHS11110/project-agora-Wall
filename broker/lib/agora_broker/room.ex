@@ -85,7 +85,7 @@ defmodule AgoraBroker.Room do
   defp join_client(pid, client, _, state) do
     ref = Process.monitor(pid)
     hash = Policy.id()
-    client = Map.merge(client, %{pid: pid, proof: hash, peer_id: nil, bound: nil})
+    client = Map.merge(client, %{pid: pid, proof: hash, peer_id: nil, bound: nil, voice_active: false, voice_muted: false})
 
     state = %{
       state
@@ -166,7 +166,7 @@ defmodule AgoraBroker.Room do
           }
 
         list_peers(client, state)
-        public = Policy.public(client.identity, id)
+        public = voice_public(client, id)
 
         for {_id, pid} <- state.peers,
             pid != client.pid,
@@ -188,6 +188,15 @@ defmodule AgoraBroker.Room do
     {:reply, :ok, state}
   end
 
+  defp handle_event(%{rtc: true, peer_id: id} = client, %{"type" => "voice_state", "active" => active, "muted" => muted}, state)
+       when is_binary(id) and is_boolean(active) and is_boolean(muted) do
+    client = %{client | voice_active: active, voice_muted: active and muted}
+    state = %{state | sessions: Map.put(state.sessions, client.pid, client)}
+    for {_id, pid} <- state.peers,
+        do: deliver(pid, %{"type" => "voice_state", "peer_id" => id, "active" => active, "muted" => client.voice_muted})
+    {:reply, :ok, state}
+  end
+
   defp handle_event(%{rtc: true, peer_id: id} = client, %{"type" => "rtc_signal"} = event, state)
        when is_binary(id) do
     target = state.peers[event["peer_id"]]
@@ -196,7 +205,7 @@ defmodule AgoraBroker.Room do
 
     if target && target != client.pid && action in ["offer", "answer", "candidate"] &&
          is_map(event[field]) && byte_size(Jason.encode!(event)) <= 262_144 do
-      public = Policy.public(client.identity, id)
+      public = voice_public(client, id)
 
       deliver(target, %{
         "type" => "rtc_signal",
@@ -718,11 +727,17 @@ defmodule AgoraBroker.Room do
     end
   end
 
+  defp voice_public(client, id) do
+    Policy.public(client.identity, id)
+    |> Map.put("voice_active", Map.get(client, :voice_active, false))
+    |> Map.put("voice_muted", Map.get(client, :voice_muted, false))
+  end
+
   defp list_peers(client, state) do
     peers =
       for {id, pid} <- state.peers,
           pid != client.pid,
-          do: Policy.public(state.sessions[pid].identity, id)
+          do: voice_public(state.sessions[pid], id)
 
     deliver(client.pid, %{
       "type" => "rtc_peers",

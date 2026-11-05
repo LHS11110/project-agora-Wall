@@ -42,6 +42,7 @@ defmodule AgoraBroker.Socket do
                  response: response,
                  sync_client_id: params["client_id"] || Policy.id(),
                  expiry: expiry,
+                 gzip: params["compression"] == "gzip-v1",
                  rtc: params["rtc"] == "true",
                  room: nil,
                  rate_second: 0,
@@ -88,6 +89,7 @@ defmodule AgoraBroker.Socket do
   defp valid_identity?(_, _), do: false
 
   def init(state) do
+    if Map.get(state,:gzip,false), do: send(self(), :compression_ready)
     {:ok, room} = Room.ensure({state.ws_port, state.route["canvas_id"]})
     Process.monitor(room)
     :ok = Room.join(room, self(), state)
@@ -100,6 +102,13 @@ defmodule AgoraBroker.Socket do
     )
 
     {:ok, %{state | room: room}}
+  end
+
+  def handle_in({data, [opcode: :binary]}, %{gzip: true} = state) do
+    case AgoraBroker.Compression.decode(data) do
+      {:ok, text} -> handle_in({text, [opcode: :text]},state)
+      _ -> {:stop, {:shutdown, :invalid_compressed_frame}, state}
+    end
   end
 
   def handle_in({text, opts}, state) when is_binary(text) and byte_size(text) <= 16_777_216 do
@@ -141,7 +150,8 @@ defmodule AgoraBroker.Socket do
   end
 
   def handle_in(_, state), do: reply(%{"type" => "error", "code" => "UNSUPPORTED_FRAME"}, state)
-  def handle_info({:deliver, payload}, state), do: {:push, {:text, Jason.encode!(payload)}, state}
+  def handle_info(:compression_ready, state), do: {:push, {:text, Jason.encode!(%{type: "transport_ready", encoding: "gzip-v1"})}, state}
+  def handle_info({:deliver, payload}, state), do: {:push, AgoraBroker.Compression.frame(payload,state), state}
 
   def handle_info({:close, reason}, state)
       when reason in [:expired, :canvas_socket_closed, :settings_changed, :revoked, :room_restart],
@@ -209,5 +219,5 @@ defmodule AgoraBroker.Socket do
     end
   end
 
-  defp reply(payload, state), do: {:reply, :ok, {:text, Jason.encode!(payload)}, state}
+  defp reply(payload, state), do: {:reply, :ok, AgoraBroker.Compression.frame(payload,state), state}
 end

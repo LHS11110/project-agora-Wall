@@ -309,6 +309,28 @@ defmodule AgoraBroker.RoomTest do
                     %{"type" => "canvas_commit", "translations" => [%{"ids" => ["yes"]}]}}
   end
 
+  test "voice state is authenticated, transient and visible to late joiners", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"rtc_canvas_connection_id" => connection, "rtc_canvas_connection_hash" => proof}}
+    rtc = listener(room, client(true, canvas))
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_ready"}}
+    assert {:error, "RTC_SIGNAL_INVALID"} = Room.submit(room, rtc, %{"type" => "voice_state", "active" => true, "muted" => false})
+    :ok = Room.submit(room, rtc, %{"type" => "rtc_join", "canvas_protocol" => 2, "canvas_transport" => "broker-v1", "canvas_connection_id" => connection, "canvas_connection_hash" => proof})
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_peers", "self_peer_id" => peer}}
+    :ok = Room.submit(room, rtc, %{"type" => "voice_state", "peer_id" => "spoofed", "active" => true, "muted" => true})
+    assert_receive {:frame, ^rtc, %{"type" => "voice_state", "peer_id" => ^peer, "active" => true, "muted" => true}}
+    other = listener(room, client(true, canvas))
+    assert_receive {:frame, ^other, %{"type" => "rtc_ready"}}
+    :ok = Room.submit(room, other, %{"type" => "rtc_join", "canvas_protocol" => 2, "canvas_transport" => "broker-v1", "canvas_connection_id" => connection, "canvas_connection_hash" => proof})
+    assert_receive {:frame, ^other, %{"type" => "rtc_peers", "peers" => [%{"peer_id" => ^peer, "voice_active" => true, "voice_muted" => true}]}}
+    assert {:error, "RTC_SIGNAL_INVALID"} = Room.submit(room, rtc, %{"type" => "voice_state", "active" => "true", "muted" => false})
+    :ok = Room.submit(room, rtc, %{"type" => "voice_state", "active" => false, "muted" => true})
+    assert_receive {:frame, ^other, %{"type" => "voice_state", "active" => false, "muted" => false}}
+    refute_receive {:query, %{"event" => %{"type" => "voice_state"}}}, 20
+    send(rtc, :stop)
+    send(other, :stop)
+  end
+
   test "presence membership never elects a host", %{room: room, canvas: canvas} do
     :ok = Room.join(room, self(), client(false, canvas))
 

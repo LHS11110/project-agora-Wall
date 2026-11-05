@@ -113,3 +113,13 @@ Blueprint execution and output nodes are shapes with `runtimeRole: executor|outp
 Only output nodes may carry bounded `runtimeResults` arrays. Execution follows
 ordinary directed canvas connectors. Outputs are persisted and broadcast through
 normal server-authoritative `canvas_ops`; code nodes do not independently execute.
+
+### Canvas voice calls
+
+Authenticated RTC members may submit `{type:"voice_state",active:boolean,muted:boolean}`.
+The broker broadcasts the normalized state with its authenticated `peer_id` to this
+canvas only. It ignores a caller-supplied peer ID, rejects unjoined sockets, and
+never persists voice state. `rtc_peers.peers[]` includes `voice_active` and
+`voice_muted` for late joiners. Disconnect removes the RTC member normally.
+Audio travels over WebRTC between opted-in users; existing `rtc_signal` forwards
+SDP/ICE to the specified room member. Canvas documents continue through the broker.
