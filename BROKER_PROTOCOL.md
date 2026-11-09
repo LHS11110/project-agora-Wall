@@ -123,3 +123,7 @@ never persists voice state. `rtc_peers.peers[]` includes `voice_active` and
 `voice_muted` for late joiners. Disconnect removes the RTC member normally.
 Audio travels over WebRTC between opted-in users; existing `rtc_signal` forwards
 SDP/ICE to the specified room member. Canvas documents continue through the broker.
+
+## Active password session proof
+
+The internal-only `POST /internal/password-session` requires `X-Agora-Internal-Token`. The body has `canvas_id`, `user_id`, `connection_id`, and `proof`. It returns `{active: boolean}` only for a live non-RTC data socket belonging to that user and canvas with the exact per-connection proof. No JWT is issued here; Spring rechecks current canvas visibility, read access and the signed password grant revision before renewing it. Wall forwards this endpoint only through its internal HTTPS listener.

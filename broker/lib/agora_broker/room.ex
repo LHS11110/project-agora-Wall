@@ -45,6 +45,17 @@ defmodule AgoraBroker.Room do
     :ok
   end
 
+  def password_session(canvas, user, connection, proof) do
+    Registry.select(AgoraBroker.RoomRegistry, [
+      {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
+    ])
+    |> Enum.any?(fn {{_port, id}, pid, _} ->
+      id == canvas and GenServer.call(pid, {:password_session, user, connection, proof}, 2000)
+    end)
+  catch
+    :exit, _ -> false
+  end
+
   def init(key) do
     Process.send_after(self(), :watermark, 1000)
     Process.send_after(self(), :lease, 30_000)
@@ -62,6 +73,17 @@ defmodule AgoraBroker.Room do
        queued_bytes: 0,
        active: nil
      }}
+  end
+
+  def handle_call({:password_session, user, connection, proof}, _, state) do
+    active =
+      Enum.any?(state.sessions, fn {pid, client} ->
+        not client.rtc and Process.alive?(pid) and client.identity["user_id"] == user and
+          client.route["connection_id"] == connection and is_binary(proof) and
+          Plug.Crypto.secure_compare(client.proof, proof)
+      end)
+
+    {:reply, active, state}
   end
 
   def handle_call({:join, pid, client}, from, state) do
@@ -85,7 +107,16 @@ defmodule AgoraBroker.Room do
   defp join_client(pid, client, _, state) do
     ref = Process.monitor(pid)
     hash = Policy.id()
-    client = Map.merge(client, %{pid: pid, proof: hash, peer_id: nil, bound: nil, voice_active: false, voice_muted: false})
+
+    client =
+      Map.merge(client, %{
+        pid: pid,
+        proof: hash,
+        peer_id: nil,
+        bound: nil,
+        voice_active: false,
+        voice_muted: false
+      })
 
     state = %{
       state
@@ -101,9 +132,11 @@ defmodule AgoraBroker.Room do
           |> Map.put("rtc_canvas_connection_id", client.route["connection_id"])
           |> Map.put("rtc_canvas_connection_hash", hash)
 
-    state = if not client.rtc and not is_nil(state.settings_revision) and
-      client.identity["settings_revision"] != state.settings_revision,
-      do: enqueue_access_refresh(state, [client], true), else: state
+    state =
+      if not client.rtc and not is_nil(state.settings_revision) and
+           client.identity["settings_revision"] != state.settings_revision,
+         do: enqueue_access_refresh(state, [client], true),
+         else: state
 
     if not client.rtc and Map.has_key?(client, :sync_client_id) do
       # Register first, then serialize the snapshot with mutations. No join gap.
@@ -154,8 +187,25 @@ defmodule AgoraBroker.Room do
 
       true ->
         id = Policy.id()
-        acl = Map.take(state.sessions[bound].identity, ["groups", "member_groups", "write_groups", "execute_groups", "is_admin", "group_bits", "group_masks", "settings_revision"])
-        identity = client.identity |> Map.drop(["_group_index", "_read_mask"]) |> Map.merge(acl) |> Policy.compile()
+
+        acl =
+          Map.take(state.sessions[bound].identity, [
+            "groups",
+            "member_groups",
+            "write_groups",
+            "execute_groups",
+            "is_admin",
+            "group_bits",
+            "group_masks",
+            "settings_revision"
+          ])
+
+        identity =
+          client.identity
+          |> Map.drop(["_group_index", "_read_mask"])
+          |> Map.merge(acl)
+          |> Policy.compile()
+
         client = %{client | peer_id: id, bound: bound, identity: identity}
 
         state =
@@ -188,12 +238,24 @@ defmodule AgoraBroker.Room do
     {:reply, :ok, state}
   end
 
-  defp handle_event(%{rtc: true, peer_id: id} = client, %{"type" => "voice_state", "active" => active, "muted" => muted}, state)
+  defp handle_event(
+         %{rtc: true, peer_id: id} = client,
+         %{"type" => "voice_state", "active" => active, "muted" => muted},
+         state
+       )
        when is_binary(id) and is_boolean(active) and is_boolean(muted) do
     client = %{client | voice_active: active, voice_muted: active and muted}
     state = %{state | sessions: Map.put(state.sessions, client.pid, client)}
+
     for {_id, pid} <- state.peers,
-        do: deliver(pid, %{"type" => "voice_state", "peer_id" => id, "active" => active, "muted" => client.voice_muted})
+        do:
+          deliver(pid, %{
+            "type" => "voice_state",
+            "peer_id" => id,
+            "active" => active,
+            "muted" => client.voice_muted
+          })
+
     {:reply, :ok, state}
   end
 
@@ -352,23 +414,38 @@ defmodule AgoraBroker.Room do
     {:noreply, state}
   end
 
-  def handle_info({ref, result}, %{active: %{ref: ref, entry: %{access_refresh: true} = entry}} = state) do
+  def handle_info(
+        {ref, result},
+        %{active: %{ref: ref, entry: %{access_refresh: true} = entry}} = state
+      ) do
     Process.demonitor(ref, [:flush])
     route = route(entry.client, entry.event)
     state = %{state | active: nil}
-    state = case result do
-      {:ok, %{"route" => ^route, "identity" => identity, "response" => %{"settings" => settings}}}
-          when is_map(identity) and is_map(settings) ->
-        state = update_access(state, entry.client, identity, settings, entry.refresh_items)
-        %{state | refresh_pending: max(0, state.refresh_pending - 1)}
-      {:ok, %{"response" => response}} ->
-        refresh_failed(entry, response["code"] || "QUERY_UNAVAILABLE", state)
-      {:error, code} when is_binary(code) -> refresh_failed(entry, code, state)
-      _ -> refresh_failed(entry, "QUERY_OUTCOME_UNKNOWN", state)
-    end
+
+    state =
+      case result do
+        {:ok,
+         %{"route" => ^route, "identity" => identity, "response" => %{"settings" => settings}}}
+        when is_map(identity) and is_map(settings) ->
+          state = update_access(state, entry.client, identity, settings, entry.refresh_items)
+          %{state | refresh_pending: max(0, state.refresh_pending - 1)}
+
+        {:ok, %{"response" => response}} ->
+          refresh_failed(entry, response["code"] || "QUERY_UNAVAILABLE", state)
+
+        {:error, code} when is_binary(code) ->
+          refresh_failed(entry, code, state)
+
+        _ ->
+          refresh_failed(entry, "QUERY_OUTCOME_UNKNOWN", state)
+      end
+
     if state.refresh_pending == 0 do
-      for {_pid, client} <- state.sessions, client.rtc and not is_nil(client.peer_id), do: list_peers(client, state)
+      for {_pid, client} <- state.sessions,
+          client.rtc and not is_nil(client.peer_id),
+          do: list_peers(client, state)
     end
+
     {:noreply, dispatch(state)}
   end
 
@@ -385,7 +462,20 @@ defmodule AgoraBroker.Room do
           else
             response =
               if Map.has_key?(entry, :initial) and response["type"] == "canvas_snapshot",
-                do: entry.initial |> Map.merge(Map.take(entry.client.identity, ["groups", "member_groups", "write_groups", "execute_groups", "is_admin", "group_bits", "group_masks"])) |> Map.merge(Map.put(response, "type", "init_items")),
+                do:
+                  entry.initial
+                  |> Map.merge(
+                    Map.take(entry.client.identity, [
+                      "groups",
+                      "member_groups",
+                      "write_groups",
+                      "execute_groups",
+                      "is_admin",
+                      "group_bits",
+                      "group_masks"
+                    ])
+                  )
+                  |> Map.merge(Map.put(response, "type", "init_items")),
                 else: response
 
             if Map.has_key?(entry, :initial) and response["type"] != "init_items",
@@ -410,8 +500,10 @@ defmodule AgoraBroker.Room do
                do: force_sync(state)
 
             state = %{state | revision: state_revision}
+
             if result["refresh_sessions"] == true do
               state = %{state | settings_revision: response["settings"]["settings_revision"]}
+
               if result["refresh_items"] == true do
                 clients = for {_pid, client} <- state.sessions, not client.rtc, do: client
                 enqueue_access_refresh(state, clients, true)
@@ -446,13 +538,15 @@ defmodule AgoraBroker.Room do
     if save_identity_valid?(entry) do
       {:noreply, start_entry(entry, state)}
     else
-      state = if Map.get(entry, :access_refresh, false) do
-        refresh_failed(entry, "QUERY_UNAUTHORIZED", state)
-      else
-        force_sync(state)
-        deliver(entry.client.pid, request_error(entry.event, "QUERY_UNAUTHORIZED"))
-        state
-      end
+      state =
+        if Map.get(entry, :access_refresh, false) do
+          refresh_failed(entry, "QUERY_UNAUTHORIZED", state)
+        else
+          force_sync(state)
+          deliver(entry.client.pid, request_error(entry.event, "QUERY_UNAUTHORIZED"))
+          state
+        end
+
       {:noreply, dispatch(state)}
     end
   end
@@ -499,52 +593,106 @@ defmodule AgoraBroker.Room do
   end
 
   defp update_settings_in_place(state, settings) do
-    sessions = Map.new(state.sessions, fn {pid, client} ->
-      identity = Map.put(client.identity, "settings_revision", settings["settings_revision"])
-      if not client.rtc do
-        personal = Map.put(settings, "can_manage", identity["is_admin"] == true)
-        deliver(pid, %{"type" => "canvas_settings_changed", "settings" => personal})
-      end
-      {pid, %{client | identity: identity}}
-    end)
+    sessions =
+      Map.new(state.sessions, fn {pid, client} ->
+        identity = Map.put(client.identity, "settings_revision", settings["settings_revision"])
+
+        if not client.rtc do
+          personal = Map.put(settings, "can_manage", identity["is_admin"] == true)
+          deliver(pid, %{"type" => "canvas_settings_changed", "settings" => personal})
+        end
+
+        {pid, %{client | identity: identity}}
+      end)
+
     %{state | sessions: sessions}
   end
 
   defp enqueue_access_refresh(state, clients, refresh_items) do
-    entries = for client <- clients, do: %{client: client, event: %{"type" => "canvas_access_refresh", "request_id" => Policy.id()}, bytes: 0, access_refresh: true, refresh_items: refresh_items}
-    %{state | queue: :queue.join(:queue.from_list(entries), state.queue), refresh_pending: state.refresh_pending + length(entries)}
+    entries =
+      for client <- clients,
+          do: %{
+            client: client,
+            event: %{"type" => "canvas_access_refresh", "request_id" => Policy.id()},
+            bytes: 0,
+            access_refresh: true,
+            refresh_items: refresh_items
+          }
+
+    %{
+      state
+      | queue: :queue.join(:queue.from_list(entries), state.queue),
+        refresh_pending: state.refresh_pending + length(entries)
+    }
   end
 
   defp update_access(state, source, identity, settings, refresh_items) do
-    fields = Map.take(identity, ["groups", "member_groups", "write_groups", "execute_groups", "is_admin", "group_bits", "group_masks", "settings_revision"])
+    fields =
+      Map.take(identity, [
+        "groups",
+        "member_groups",
+        "write_groups",
+        "execute_groups",
+        "is_admin",
+        "group_bits",
+        "group_masks",
+        "settings_revision"
+      ])
+
     # Both transports retain their connection IDs and expiry, while sharing the new ACL.
-    sessions = Map.new(state.sessions, fn {pid, client} ->
-      if client.identity["user_id"] == source.identity["user_id"] do
-        clean = Map.drop(client.identity, ["_group_index", "_read_mask"])
-        {pid, %{client | identity: Policy.compile(Map.merge(clean, fields))}}
-      else
-        {pid, client}
-      end
-    end)
+    sessions =
+      Map.new(state.sessions, fn {pid, client} ->
+        if client.identity["user_id"] == source.identity["user_id"] do
+          clean = Map.drop(client.identity, ["_group_index", "_read_mask"])
+          {pid, %{client | identity: Policy.compile(Map.merge(clean, fields))}}
+        else
+          {pid, client}
+        end
+      end)
+
     state = %{state | sessions: sessions}
+
     if Map.has_key?(sessions, source.pid) do
-      deliver(source.pid, Map.merge(fields, %{"type" => "canvas_access_changed", "settings" => settings, "refresh_items" => refresh_items}))
-      if refresh_items, do: deliver(source.pid, %{"type" => "canvas_watermark", "revision" => state.revision, "force_sync" => true})
+      deliver(
+        source.pid,
+        Map.merge(fields, %{
+          "type" => "canvas_access_changed",
+          "settings" => settings,
+          "refresh_items" => refresh_items
+        })
+      )
+
+      if refresh_items,
+        do:
+          deliver(source.pid, %{
+            "type" => "canvas_watermark",
+            "revision" => state.revision,
+            "force_sync" => true
+          })
     end
+
     state
   end
 
   defp refresh_failed(entry, code, state) do
-    transient = code in ["SETTINGS_STORAGE_ERROR", "CANVAS_NOT_READY"] and save_identity_valid?(entry)
+    transient =
+      code in ["SETTINGS_STORAGE_ERROR", "CANVAS_NOT_READY"] and save_identity_valid?(entry)
+
     if transient or retry_save?(entry, code) do
       defer_save(entry, code, state)
     else
-      clients = for {pid, client} <- state.sessions, client.identity["user_id"] == entry.client.identity["user_id"], do: pid
-      state = Enum.reduce(clients, state, fn pid, current ->
-        deliver(pid, %{"type" => "canvas_access_revoked", "code" => code})
-        send(pid, {:close, :revoked})
-        remove(pid, current)
-      end)
+      clients =
+        for {pid, client} <- state.sessions,
+            client.identity["user_id"] == entry.client.identity["user_id"],
+            do: pid
+
+      state =
+        Enum.reduce(clients, state, fn pid, current ->
+          deliver(pid, %{"type" => "canvas_access_revoked", "code" => code})
+          send(pid, {:close, :revoked})
+          remove(pid, current)
+        end)
+
       %{state | refresh_pending: max(0, state.refresh_pending - 1)}
     end
   end
@@ -577,7 +725,8 @@ defmodule AgoraBroker.Room do
         state = %{state | queue: rest, queued_bytes: state.queued_bytes - entry.bytes}
 
         cond do
-          not Map.has_key?(state.sessions, entry.client.pid) and Map.get(entry, :access_refresh, false) ->
+          not Map.has_key?(state.sessions, entry.client.pid) and
+              Map.get(entry, :access_refresh, false) ->
             dispatch(%{state | refresh_pending: max(0, state.refresh_pending - 1)})
 
           not Map.has_key?(state.sessions, entry.client.pid) and
@@ -623,7 +772,8 @@ defmodule AgoraBroker.Room do
 
   defp retry_save?(entry, code),
     do:
-      (entry.event["type"] == "canvas_ops" or Map.get(entry, :access_refresh, false)) and code in @retryable_save_errors and
+      (entry.event["type"] == "canvas_ops" or Map.get(entry, :access_refresh, false)) and
+        code in @retryable_save_errors and
         save_identity_valid?(entry)
 
   defp defer_save(entry, code, state) do
@@ -637,7 +787,8 @@ defmodule AgoraBroker.Room do
     }
   end
 
-  defp failed_query(%{access_refresh: true} = entry, code, state), do: refresh_failed(entry, code, state)
+  defp failed_query(%{access_refresh: true} = entry, code, state),
+    do: refresh_failed(entry, code, state)
 
   defp failed_query(entry, code, state) do
     if retry_save?(entry, code) do

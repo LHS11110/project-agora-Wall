@@ -23,7 +23,8 @@ services:
       agora-services:
         aliases: [agora-mssql, agora-elasticsearch]
       agora-net: {}
-      redis-ha: {}
+      redis-ha:
+        ipv4_address: ${STORAGE_REDIS_BROKER_IP:-172.20.0.21}
     healthcheck:
       test: [CMD, haproxy, -c, -f, /usr/local/etc/haproxy/haproxy.cfg]
       interval: 10s

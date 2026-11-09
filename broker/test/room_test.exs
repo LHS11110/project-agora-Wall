@@ -86,6 +86,18 @@ defmodule AgoraBroker.RoomTest do
     %{room: room, canvas: canvas}
   end
 
+  test "password renewal requires a matching live canvas connection, user and proof", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"type" => "init_items", "rtc_canvas_connection_id" => id, "rtc_canvas_connection_hash" => proof}}
+    assert Room.password_session(canvas, 7, id, proof)
+    refute Room.password_session(canvas, 8, id, proof)
+    refute Room.password_session(canvas + 999999, 7, id, proof)
+    refute Room.password_session(canvas, 7, id, "wrong")
+    refute Room.password_session(canvas, 7, "wrong", proof)
+    Room.leave(room, self())
+    refute Room.password_session(canvas, 7, id, proof)
+  end
+
   defp client(rtc, canvas, group \\ "group") do
     %{
       ws_port: 8002,

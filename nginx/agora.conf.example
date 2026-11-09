@@ -227,6 +227,16 @@ server {
     proxy_ssl_verify_depth 2;
     proxy_ssl_server_name on;
     proxy_ssl_protocols TLSv1.3;
+    location = /internal/broker/password-session {
+        set $password_broker agora-broker;
+        proxy_ssl_name ${BROKER_TLS_SERVER_NAME};
+        proxy_pass https://$password_broker:4443/internal/password-session;
+        proxy_set_header X-Agora-Internal-Token $http_x_agora_internal_token;
+        proxy_connect_timeout 2s;
+        proxy_read_timeout 3s;
+        client_max_body_size 4k;
+        access_log off;
+    }
     location = /internal/search/embedding {
         set $embedding_host agora-search-embedding;
         proxy_ssl_name agora-spring;
