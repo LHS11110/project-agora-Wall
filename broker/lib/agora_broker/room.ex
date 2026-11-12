@@ -344,6 +344,7 @@ defmodule AgoraBroker.Room do
         "canvas_sync",
         "workspace_ops",
         "workspace_sync",
+        "workspace_files",
         "runtime_execute",
         "chat",
         "chat_history",
@@ -374,6 +375,9 @@ defmodule AgoraBroker.Room do
         size = byte_size(Jason.encode!(event))
 
         cond do
+          type == "workspace_files" and not workspace_files_allowed?(client.identity, event, size) ->
+            {:reply, {:error, "WORKSPACE_ACCESS_DENIED"}, state}
+
           type == "runtime_execute" and not runtime_request_valid?(event) ->
             {:reply, {:error, "RUNTIME_REQUEST_INVALID"}, state}
 
@@ -426,6 +430,14 @@ defmodule AgoraBroker.Room do
   defp runtime_busy?(event,state) do
     service=event["action"]=="service"
     Enum.count(state.runtime_tasks,fn {_,entry}->(entry.event["action"]=="service")==service end)>=(if service,do: 4,else: 1)
+  end
+
+  defp workspace_files_allowed?(identity, event, size) do
+    read = event["operation"] in ["stat", "list", "read"]
+    allowed = event["operation"] in ["stat", "list", "read", "write", "mkdir", "rename", "delete"]
+    allowed and size <= 700_000 and
+      (identity["is_admin"] == true or
+        ((identity["groups"] || []) != [] and (read or (identity["write_groups"] || []) != [])))
   end
 
   defp runtime_allowed?(identity, event) do

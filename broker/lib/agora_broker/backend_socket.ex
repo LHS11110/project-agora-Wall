@@ -57,6 +57,7 @@ defmodule AgoraBroker.BackendSocket do
         timeout =
           cond do
             input["command"] == "connect" -> 40_000
+            get_in(input, ["event", "type"]) == "workspace_files" -> 20_000
             get_in(input, ["event", "type"]) == "runtime_execute" -> 245_000
             true -> 10_000
           end

@@ -10,6 +10,7 @@ defmodule AgoraBroker.Backend do
     timeout =
       cond do
         command == "connect" -> 45_000
+        get_in(input, ["event", "type"]) == "workspace_files" -> 25_000
         get_in(input, ["event", "type"]) == "runtime_execute" -> 255_000
         true -> 12_000
       end

@@ -113,6 +113,34 @@ defmodule AgoraBroker.RoomTest do
     }
   end
 
+  test "workspace file reads use the session identity and writes require canvas write access", %{room: room, canvas: canvas} do
+    base = client(false, canvas)
+    :ok = Room.join(room, self(), base)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    read = %{"type" => "workspace_files", "operation" => "read", "path" => "/main.lean", "request_id" => "file-read", "user_id" => 99, "canvas_id" => 999, "identity" => %{"is_admin" => true}}
+    :ok = Room.submit(room, self(), read)
+    assert_receive {:query, %{"event" => %{"type" => "workspace_files"} = forwarded, "identity" => identity}}
+    assert identity["user_id"] == 7
+    refute Map.has_key?(forwarded, "identity")
+    refute Map.has_key?(forwarded, "user_id")
+    refute Map.has_key?(forwarded, "canvas_id")
+    assert {:error, "WORKSPACE_ACCESS_DENIED"} = Room.submit(room, self(), %{read | "operation" => "write"})
+  end
+
+  test "workspace changes reach joined data sessions", %{room: room, canvas: canvas} do
+    base = client(false, canvas)
+    writer = %{base | identity: Map.put(base.identity, "write_groups", ["group"])}
+    :ok = Room.join(room, self(), writer)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    peer = listener(room, base)
+    assert_receive {:frame, ^peer, %{"type" => "init_items"}}
+    change = %{"type" => "workspace_files_changed", "path" => "/proof.v", "operation" => "write"}
+    :ok = Room.submit(room, self(), %{"type" => "workspace_files", "operation" => "write", "path" => "/proof.v", "request_id" => "file-write", "test_broadcasts" => [%{"all" => true, "event" => change}]})
+    assert_receive {:deliver, ^change}
+    assert_receive {:frame, ^peer, ^change}
+    send(peer, :stop)
+  end
+
   defp listener(room, base) do
     parent = self()
 

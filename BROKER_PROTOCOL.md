@@ -1,5 +1,13 @@
 # Phoenix ↔ C++ 지속 WSS 프로토콜
 
+## VM workspace files
+
+`workspace_files` uses the existing authenticated Canvas socket and ordered Room queue. Supported operations are `stat`, `list`, `read`, `write`, `mkdir`, `rename`, `delete`. Wall strips caller-provided identity/canvas fields and requires canvas read access; writes additionally require canvas write access. C++ checks the current settings revision, request shape and paths, derives the canvas/user from the verified identity, then forwards to that canvas's VM through the existing manager socket. The VSOCK file service is never public.
+
+Only successful mutations emit `workspace_files_changed` invalidations to this canvas's data sockets. File contents are returned only to the requester after an authorized read. Clients merge the VM's saved Automerge document with pending local edits. Mutations retry with the same `request_id` and payload; the guest keeps durable receipts. This protocol is independent of the older notebook-only `workspace_ops` and `workspace_sync` relay.
+
+Workspace frames are at most 700,000 bytes, with a 20-second backend timeout (25-second caller timeout). Existing Room queue/memory/rate limits apply. The HTTPS IDE and its isolated extension-host subdomains must be explicitly included in `BROKER_ALLOWED_ORIGINS`, for example `https://*.ide.example.com:8080`; existing allowed origins are retained. Spring's corresponding optional CORS pattern is configured with `CORS_ALLOWED_ORIGIN_PATTERNS`.
+
 브라우저 → Nginx → Phoenix 브로커 → C++ 쿼리 서비스 → CanvasServiceMemory → MemoryClass → LRU/Redis 구조입니다. Nginx와 브로커 사이도 TLS를 사용합니다. Phoenix는 접속·피어·응답 대상과 브로드캐스트를 관리하고, 브로커는 사용자 JWT 인증을 수행하고 C++는 참여 권한 데이터·객체 접근 권한·CRUD·채팅·설정·저장을 처리합니다. WebRTC P2P는 통화 미디어에만 사용합니다. 브라우저 호스트 선출과 승인 단계는 없습니다.
 
 ## 전송
