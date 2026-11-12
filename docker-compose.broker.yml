@@ -6,6 +6,11 @@ services:
     image: project-agora-broker:local
     container_name: agora-broker
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     init: true
     read_only: true
     tmpfs:

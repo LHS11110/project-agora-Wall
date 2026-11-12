@@ -35,7 +35,9 @@ defmodule AgoraBroker.BackendSocket do
     {:ok, %{gun: gun, stream: nil, ready: false, pending: %{}, bytes: 0}}
   end
 
-  def handle_call({:request, input}, from, %{ready: true} = state)
+  def handle_call({:request, input}, from, state), do: handle_call({:request, input, nil}, from, state)
+
+  def handle_call({:request, input, runtime_sink}, from, %{ready: true} = state)
       when map_size(state.pending) < 64 do
     id = {input["route"]["connection_id"], input["route"]["request_id"]}
     payload = Jason.encode!(input)
@@ -52,7 +54,13 @@ defmodule AgoraBroker.BackendSocket do
 
       true ->
         :ok = :gun.ws_send(state.gun, state.stream, {:text, payload})
-        timer = Process.send_after(self(), {:timeout, id}, if(input["command"] == "connect", do: 40_000, else: 10_000))
+        timeout =
+          cond do
+            input["command"] == "connect" -> 40_000
+            get_in(input, ["event", "type"]) == "runtime_execute" -> 245_000
+            true -> 10_000
+          end
+        timer = Process.send_after(self(), {:timeout, id}, timeout)
 
         pending =
           Map.put(state.pending, id, %{
@@ -60,6 +68,7 @@ defmodule AgoraBroker.BackendSocket do
             route: input["route"],
             timer: timer,
             command: input["command"],
+            runtime_sink: runtime_sink,
             bytes: byte_size(payload)
           })
 
@@ -67,8 +76,8 @@ defmodule AgoraBroker.BackendSocket do
     end
   end
 
-  def handle_call({:request, _}, _, %{ready: true} = state), do: {:reply, {:error, "BROKER_BUSY"}, state}
-  def handle_call({:request, _}, _, state),
+  def handle_call({:request, _, _}, _, %{ready: true} = state), do: {:reply, {:error, "BROKER_BUSY"}, state}
+  def handle_call({:request, _, _}, _, state),
     do: {:reply, {:error, "BROKER_BACKEND_UNAVAILABLE"}, state}
 
   def handle_info({:gun_up, gun, :http}, %{gun: gun} = state) do
@@ -96,17 +105,29 @@ defmodule AgoraBroker.BackendSocket do
       {:ok, %{"route" => route} = result} ->
         id = {route["connection_id"], route["request_id"]}
 
-        case Map.pop(state.pending, id) do
-          {nil, _} ->
-            {:noreply, state}
+        if get_in(result, ["response", "type"]) == "runtime_output" do
+          case Map.get(state.pending, id) do
+            %{route: ^route, runtime_sink: sink} when is_pid(sink) ->
+              send(sink, {:runtime_output, route, result["response"]})
 
-          {%{route: ^route} = entry, pending} ->
-            Process.cancel_timer(entry.timer)
-            GenServer.reply(entry.from, {:ok, result})
-            {:noreply, %{state | pending: pending, bytes: state.bytes - entry.bytes}}
+            _ ->
+              :ok
+          end
 
-          _ ->
-            {:stop, :invalid_query_route, fail_all(state)}
+          {:noreply, state}
+        else
+          case Map.pop(state.pending, id) do
+            {nil, _} ->
+              {:noreply, state}
+
+            {%{route: ^route} = entry, pending} ->
+              Process.cancel_timer(entry.timer)
+              GenServer.reply(entry.from, {:ok, result})
+              {:noreply, %{state | pending: pending, bytes: state.bytes - entry.bytes}}
+
+            _ ->
+              {:stop, :invalid_query_route, fail_all(state)}
+          end
         end
 
       _ ->

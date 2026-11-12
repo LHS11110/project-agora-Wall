@@ -110,7 +110,7 @@ Compose 프로젝트 이름 `agora-gateway`, 컨테이너 `agora-nginx`, 네트�
 
 ## 서버 ID 기반 C++ API 라우팅
 
-Spring은 C++ IP·포트를 호출 주소로 사용하지 않고 `WALL_CPP_API_ORIGIN`(기본 `https://agora-nginx:8444`)에 요청합니다. 경로는 `/internal/cpp/servers/{serverId}/api/canvas/count`이며, ID는 DB `cpp_server.server_id`입니다. Nginx가 ID를 실제 C++ HTTPS 주소로 변환합니다. Spring → Nginx와 Nginx → C++ 두 구간 모두 CA와 호스트명을 검증합니다. 내부 API 토큰과 요청 ID도 전달합니다. 미등록 ID나 라우팅 실패 시 C++ 직접 연결로 우회하지 않습니다.
+Spring은 C++ IP·포트를 호출 주소로 사용하지 않고 `WALL_CPP_API_ORIGIN`(기본 `https://agora-nginx:8444`)에 요청합니다. 경로는 `/internal/cpp/servers/{serverId}/api/...`이며, ID는 DB `cpp_server.server_id`입니다. Nginx가 ID를 실제 C++ HTTPS 주소로 변환합니다. Spring → Nginx와 Nginx → C++ 두 구간 모두 CA와 호스트명을 검증합니다. 내부 API 토큰과 요청 ID도 전달합니다. VM 코드·셀 실행의 `/api/runtime/forward`는 최대 240초 대기하고 스트리밍 출력 버퍼링을 끕니다. 미등록 ID나 라우팅 실패 시 C++ 직접 연결로 우회하지 않습니다.
 
 [`nginx/cpp-routes.conf`](nginx/cpp-routes.conf)의 두 map에 동일한 서버 ID를 설정합니다. 첫 map 값은 IP 또는 DNS 이름과 REST 포트이며, 두 번째 값은 인증서의 SAN과 일치하는 검증 이름입니다. 예를 들어 서버 ID 42가 `172.23.0.30:8000`, 인증서 이름이 `cpp-node-42`라면 각각 `42 172.23.0.30:8000;`과 `42 cpp-node-42;`를 추가합니다. 기본 예시 ID 1은 실제 DB 등록 ID에 맞춰 수정합니다. 브로커의 WSS 대상 목록은 별도 설정입니다.
 

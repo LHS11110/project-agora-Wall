@@ -45,15 +45,15 @@ defmodule AgoraBroker.Room do
     :ok
   end
 
-  def password_session(canvas, user, connection, proof) do
-    Registry.select(AgoraBroker.RoomRegistry, [
-      {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
-    ])
-    |> Enum.any?(fn {{_port, id}, pid, _} ->
-      id == canvas and GenServer.call(pid, {:password_session, user, connection, proof}, 2000)
-    end)
-  catch
-    :exit, _ -> false
+  def broadcast_workspace(id, payload) when is_map(payload) do
+    for {{_port, canvas}, pid, _} <-
+          Registry.select(AgoraBroker.RoomRegistry, [
+            {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
+          ]),
+        is_nil(id) or canvas == id,
+        do: GenServer.cast(pid, {:workspace_broadcast, payload})
+
+    :ok
   end
 
   def init(key) do
@@ -71,19 +71,9 @@ defmodule AgoraBroker.Room do
        refresh_pending: 0,
        queue: :queue.new(),
        queued_bytes: 0,
-       active: nil
+       active: nil,
+       runtime_tasks: %{}
      }}
-  end
-
-  def handle_call({:password_session, user, connection, proof}, _, state) do
-    active =
-      Enum.any?(state.sessions, fn {pid, client} ->
-        not client.rtc and Process.alive?(pid) and client.identity["user_id"] == user and
-          client.route["connection_id"] == connection and is_binary(proof) and
-          Plug.Crypto.secure_compare(client.proof, proof)
-      end)
-
-    {:reply, active, state}
   end
 
   def handle_call({:join, pid, client}, from, state) do
@@ -115,7 +105,8 @@ defmodule AgoraBroker.Room do
         peer_id: nil,
         bound: nil,
         voice_active: false,
-        voice_muted: false
+        voice_muted: false,
+        screen_sharing: false
       })
 
     state = %{
@@ -123,6 +114,11 @@ defmodule AgoraBroker.Room do
       | sessions: Map.put(state.sessions, pid, client),
         refs: Map.put(state.refs, ref, pid)
     }
+
+    if client.response["participant_joined"] == true do
+      for {other_pid, other} <- state.sessions, other_pid != pid and not other.rtc,
+        do: deliver(other_pid, %{"type" => "canvas_participants_changed"})
+    end
 
     response =
       if client.rtc,
@@ -240,11 +236,12 @@ defmodule AgoraBroker.Room do
 
   defp handle_event(
          %{rtc: true, peer_id: id} = client,
-         %{"type" => "voice_state", "active" => active, "muted" => muted},
+         %{"type" => "voice_state", "active" => active, "muted" => muted} = event,
          state
        )
        when is_binary(id) and is_boolean(active) and is_boolean(muted) do
-    client = %{client | voice_active: active, voice_muted: active and muted}
+    sharing = Map.get(event, "screen_sharing", false)
+    client = %{client | voice_active: active, voice_muted: active and muted, screen_sharing: active and sharing == true}
     state = %{state | sessions: Map.put(state.sessions, client.pid, client)}
 
     for {_id, pid} <- state.peers,
@@ -253,7 +250,8 @@ defmodule AgoraBroker.Room do
             "type" => "voice_state",
             "peer_id" => id,
             "active" => active,
-            "muted" => client.voice_muted
+            "muted" => client.voice_muted,
+            "screen_sharing" => client.screen_sharing
           })
 
     {:reply, :ok, state}
@@ -336,11 +334,17 @@ defmodule AgoraBroker.Room do
 
   defp handle_event(client, event, state) do
     type = event["type"]
+    client = if type in ["canvas_sync", "canvas_ops"] and event["delta_commits"] == true,
+      do: %{client | identity: Map.put(client.identity, "delta_commits", true)}, else: client
+    state = if Map.has_key?(state.sessions, client.pid), do: put_in(state.sessions[client.pid], client), else: state
 
     cond do
       type not in [
         "canvas_ops",
         "canvas_sync",
+        "workspace_ops",
+        "workspace_sync",
+        "runtime_execute",
         "chat",
         "chat_history",
         "mentions_get",
@@ -369,33 +373,149 @@ defmodule AgoraBroker.Room do
         event = Map.put(event, "request_id", valid_id(event["request_id"]))
         size = byte_size(Jason.encode!(event))
 
-        pending = pending_save(state, client, event)
-
         cond do
-          pending == :same ->
-            {:reply, :ok, state}
+          type == "runtime_execute" and not runtime_request_valid?(event) ->
+            {:reply, {:error, "RUNTIME_REQUEST_INVALID"}, state}
 
-          pending == :mismatch ->
-            {:reply, {:error, "CLIENT_REQUEST_MISMATCH"}, state}
+          type == "runtime_execute" and not runtime_allowed?(client.identity, event) ->
+            {:reply, {:error, "RUNTIME_EXECUTION_DENIED"}, state}
 
-          :queue.len(state.queue) >= @max_queue or state.queued_bytes + size > @max_bytes ->
-            {:reply, {:error, "BROKER_BUSY"}, state}
+          type == "runtime_execute" and size > 800_000 ->
+            {:reply, {:error, "RUNTIME_REQUEST_TOO_LARGE"}, state}
+
+          type == "runtime_execute" and runtime_busy?(event, state) ->
+            {:reply, {:error, "RUNTIME_BUSY"}, state}
+
+          type == "runtime_execute" ->
+            {:reply, :ok, start_runtime_request(client, event, state)}
 
           true ->
-            entry = %{client: client, event: event, bytes: size}
-
-            state =
-              %{
-                state
-                | queue: :queue.in(entry, state.queue),
-                  queued_bytes: state.queued_bytes + size
-              }
-              |> dispatch()
-
-            {:reply, :ok, state}
+            queue_event(client, event, size, state)
         end
     end
   end
+
+  defp queue_event(client, event, size, state) do
+    pending = pending_save(state, client, event)
+
+    cond do
+      pending == :same ->
+        {:reply, :ok, state}
+
+      pending == :mismatch ->
+        {:reply, {:error, "CLIENT_REQUEST_MISMATCH"}, state}
+
+      :queue.len(state.queue) >= @max_queue or state.queued_bytes + size > @max_bytes ->
+        {:reply, {:error, "BROKER_BUSY"}, state}
+
+      true ->
+        entry = %{client: client, event: event, bytes: size}
+
+        state =
+          %{
+            state
+            | queue: :queue.in(entry, state.queue),
+              queued_bytes: state.queued_bytes + size
+          }
+          |> dispatch()
+
+        {:reply, :ok, state}
+    end
+  end
+
+  defp runtime_busy?(event,state) do
+    service=event["action"]=="service"
+    Enum.count(state.runtime_tasks,fn {_,entry}->(entry.event["action"]=="service")==service end)>=(if service,do: 4,else: 1)
+  end
+
+  defp runtime_allowed?(identity, event) do
+    if event["action"]=="service" do
+      request=event["service"]||%{}
+      read=request["operation"]=="resource" or (request["operation"] in [nil,"api"] and (request["method"] in [nil,"GET"] or String.starts_with?(request["path"]||"", "/github") or request["path"] in ["/access","/link-preview"]))
+      manager=String.starts_with?(request["path"]||"", "/bots") or request["path"] in ["/github/bind","/github/permissions","/people"] or (request["path"]=="" and request["method"]=="DELETE") or (request["path"]=="/image" and not read)
+      identity["is_admin"]==true or (not manager and (if request["path"]=="/runtime/terminal/ticket",do: Policy.can_execute?(identity),else: (if read,do: (identity["groups"]||[])!=[],else: (identity["write_groups"]||[])!=[])))
+    else
+    if event["action"] == "manage" and get_in(event, ["management", "action"]) == "settings_get" do
+      identity["is_admin"] == true or (identity["groups"] || []) != []
+    else
+      manage = event["action"] == "manage" or (event["action"] == "notebook" and event["operation"] == "prepare")
+      Policy.can_execute?(identity) and (not manage or identity["is_admin"] == true or (identity["write_groups"] || []) != [])
+    end
+  end
+  end
+
+  defp runtime_request_valid?(event) do
+    action = event["action"]
+    code = event["code"]
+    object_id = event["object_id"]
+    if action=="service" do
+      is_map(event["service"]) and is_binary(event["service"]["path"]) and byte_size(event["service"]["path"])<=2048 and event["service"]["operation"] in [nil,"api","resource","upload_begin","upload_chunk","upload_finish","upload_cancel"]
+    else
+    if action == "manage" do
+      is_map(event["management"]) and event["management"]["action"] in ["settings_get", "settings_set", "resources_set", "disk_set", "java_dependencies", "reset"]
+    else
+      is_binary(action) and action in ["execute", "build", "notebook"] and
+        is_binary(code) and byte_size(code) <= 65_536 and
+        is_binary(object_id) and byte_size(object_id) in 1..128 and
+        (action == "notebook" or event["language"] in ["python", "javascript", "c", "cpp", "bash", "java"]) and
+        (action != "notebook" or
+          (event["operation"] in [nil, "execute", "prepare", "reset"] and
+           is_binary(event["notebook_id"]) and byte_size(event["notebook_id"]) in 1..128 and
+           (event["operation"] in ["prepare", "reset"] or (is_binary(event["cell_id"]) and byte_size(event["cell_id"]) in 1..128)))) and
+        (is_nil(event["stdin"]) or (is_binary(event["stdin"]) and byte_size(event["stdin"]) <= 65_536))
+    end
+  end
+  end
+
+  defp start_runtime_request(client, event, state) do
+    backend = Application.get_env(:agora_broker, :backend, AgoraBroker.Backend)
+    route = route(client, event)
+    input = %{
+      "route" => route,
+      "identity" => Map.drop(client.identity, ["_group_index", "_read_mask"]),
+      "ws_port" => client.ws_port,
+      "runtime_sink" => self(),
+      "event" => event
+    }
+
+    task =
+      try do
+        {:ok, Task.Supervisor.async_nolink(AgoraBroker.Tasks, fn -> backend.query(input) end)}
+      rescue
+        RuntimeError -> {:error, "BROKER_BUSY"}
+      end
+
+    case task do
+      {:ok, task} ->
+        task_info = %{client: client, event: event, route: route, pid: task.pid}
+        put_in(state.runtime_tasks[task.ref], task_info)
+
+      {:error, code} ->
+        deliver(client.pid, request_error(event, code))
+        state
+    end
+  end
+
+  defp runtime_response(entry, {:ok, %{"route" => route, "response" => response}}) when is_map(response) do
+    cond do
+      route != entry.route -> runtime_error(entry.event, "QUERY_ROUTE_INVALID")
+      response["type"] == "runtime_result" -> Map.put_new(response, "request_id", entry.event["request_id"])
+      true -> runtime_error(entry.event, response["code"] || "QUERY_UNAVAILABLE")
+    end
+  end
+
+  defp runtime_response(entry, {:error, code}) when is_binary(code),
+    do: runtime_error(entry.event, code)
+
+  defp runtime_response(entry, _), do: runtime_error(entry.event, "QUERY_OUTCOME_UNKNOWN")
+
+  defp runtime_error(event, code),
+    do: %{
+      "type" => "runtime_result",
+      "ok" => false,
+      "code" => code,
+      "request_id" => event["request_id"]
+    }
 
   def handle_cast({:leave, pid}, state), do: {:noreply, remove(pid, state)}
 
@@ -409,6 +529,17 @@ defmodule AgoraBroker.Room do
       })
 
       send(pid, {:close, :revoked})
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_cast({:workspace_broadcast, payload}, state) when is_map(payload) do
+    frame = Map.put_new(payload, "type", "workspace_commit")
+
+    for {pid, client} <- state.sessions,
+        not client.rtc do
+      deliver(pid, frame)
     end
 
     {:noreply, state}
@@ -525,6 +656,15 @@ defmodule AgoraBroker.Room do
     {:noreply, dispatch(state)}
   end
 
+  def handle_info({ref, result}, %{runtime_tasks: runtime_tasks} = state)
+      when is_map_key(runtime_tasks, ref) do
+    Process.demonitor(ref, [:flush])
+    {entry, runtime_tasks} = Map.pop!(runtime_tasks, ref)
+    response = runtime_response(entry, result)
+    if Map.has_key?(state.sessions, entry.client.pid), do: deliver(entry.client.pid, response)
+    {:noreply, %{state | runtime_tasks: runtime_tasks}}
+  end
+
   def handle_info(
         {:DOWN, ref, :process, _pid, _reason},
         %{active: %{ref: ref, entry: entry}} = state
@@ -552,6 +692,29 @@ defmodule AgoraBroker.Room do
   end
 
   def handle_info({:retry_save, _}, state), do: {:noreply, state}
+
+  def handle_info({:runtime_output, route, %{"type" => "runtime_output", "output" => output}}, state)
+      when is_binary(output) do
+    entry = Enum.find_value(state.runtime_tasks, fn {_ref, task} -> if task.route == route, do: task end)
+
+    if entry && Map.has_key?(state.sessions, entry.client.pid) do
+      deliver(entry.client.pid, %{
+        "type" => "runtime_output",
+        "request_id" => entry.event["request_id"],
+        "output" => output
+      })
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{runtime_tasks: runtime_tasks} = state)
+      when is_map_key(runtime_tasks, ref) do
+    {entry, runtime_tasks} = Map.pop!(runtime_tasks, ref)
+    if Map.has_key?(state.sessions, entry.client.pid),
+      do: deliver(entry.client.pid, runtime_error(entry.event, "QUERY_OUTCOME_UNKNOWN"))
+    {:noreply, %{state | runtime_tasks: runtime_tasks}}
+  end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
     case Map.pop(state.refs, ref) do
@@ -839,7 +1002,7 @@ defmodule AgoraBroker.Room do
   defp pending_save(_, _, _), do: nil
 
   def format_status(status),
-    do: Map.update(status, :state, %{}, &Map.drop(&1, [:sessions, :queue, :active]))
+    do: Map.update(status, :state, %{}, &Map.drop(&1, [:sessions, :queue, :active, :runtime_tasks]))
 
   defp request_error(event, code),
     do: %{
@@ -882,6 +1045,7 @@ defmodule AgoraBroker.Room do
     Policy.public(client.identity, id)
     |> Map.put("voice_active", Map.get(client, :voice_active, false))
     |> Map.put("voice_muted", Map.get(client, :voice_muted, false))
+    |> Map.put("screen_sharing", Map.get(client, :screen_sharing, false))
   end
 
   defp list_peers(client, state) do
@@ -909,7 +1073,7 @@ defmodule AgoraBroker.Room do
             ids != [],
             do: Map.put(move, "ids", ids)
 
-      Map.put(event, "translations", translations)
+      event |> Map.delete("deltas") |> Map.put("translations", translations)
     else
       items =
         Enum.reduce(event["items"] || %{}, %{}, fn {id, item}, result ->
@@ -925,7 +1089,19 @@ defmodule AgoraBroker.Room do
           end
         end)
 
-      Map.put(event, "items", items)
+      deltas = event["deltas"] || %{}
+      if identity["delta_commits"] == true do
+        {full, patches} = Enum.reduce(items, {%{}, %{}}, fn {id, item}, {full, patches} ->
+          if not is_nil(item) and Map.has_key?(deltas, id) and Policy.visible?(identity, previous[id]) do
+            {full, Map.put(patches, id, deltas[id])}
+          else
+            {Map.put(full, id, item), patches}
+          end
+        end)
+        event |> Map.delete("deltas") |> Map.put("items", full) |> Map.put("patches", patches)
+      else
+        event |> Map.delete("deltas") |> Map.put("items", items)
+      end
     end
   end
 

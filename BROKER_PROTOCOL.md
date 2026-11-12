@@ -32,6 +32,18 @@ RTC 연결이나 다른 사용자의 승인 없이 `canvas_ops`를 전송할 수
 브로커는 항목별 새/이전 권한으로 데이터를 필터링하고, 권한을 잃은 항목은 삭제로 전달합니다.
 빈 변경도 순번을 전달합니다. 이동만 있는 배치는 ID 목록과 방향 벡터로 공유합니다.
 
+코드 객체와 노트북 셀 실행은 이미 접속된 Canvas WebSocket에서
+`{type:"runtime_execute", action:"execute"|"build"|"notebook", object_id, language?, notebook_id?, cell_id?, code, stdin?, request_id}`로
+요청합니다. Phoenix는 연결의 서버 측 identity에서 `execute_groups`를 확인하고, 캔버스당 한 번에
+하나의 커널 요청만 실행하도록 별도 비동기 task로 C++ query socket에 전달합니다. 런타임 요청은
+저장 작업 Room 대기열의 활성 슬롯을 점유하지 않아 편집·채팅 요청을 막지 않습니다. C++는 최신
+settings revision, 실행 그룹 권한, 코드 객체 또는 노트북 root/cell 객체 ACL을 다시 확인하고
+VM 관리자 Unix socket에 요청합니다. 커널 결과는 `runtime_result`와 같은 request_id로 요청자에게
+돌아옵니다. 일반 코드의 출력 조각은 `runtime_output`으로 같은 요청 연결에 전달하고, 완료된 결과는
+`runtime_result`로 반환합니다. 실행 데이터와 결과는 다른 사용자에게 방송되지 않습니다. 브라우저가 보내는 user_id·identity·capability 값은
+제거하고 WebSocket 연결에서 검증한 identity를 사용합니다. 실행 및 사전 빌드는 최대 200초 안에
+완료되어야 하며 VM worker 자체에도 별도 실행 제한이 적용됩니다.
+
 | 경계 | 상한 |
 | --- | --- |
 | 브라우저 JSON 프레임 | 16 MiB, 연결당 초당 240개 |
@@ -43,7 +55,7 @@ RTC 연결이나 다른 사용자의 승인 없이 `canvas_ops`를 전송할 수
 | 단일 객체 작업 배치 | 512개 |
 
 과부하 시 요청을 거절하고 무제한 메모리 증가를 막습니다. 느린 소비자는 재접속합니다.
-대상별 일반 응답 제한 시간은 10초이며 연결 인증은 40초입니다. 결과가 불명확하면
+대상별 일반 응답 제한 시간은 10초이며 연결 인증은 40초입니다. 실행 요청은 최대 195초입니다. 결과가 불명확하면
 `QUERY_OUTCOME_UNKNOWN`을 반환합니다. 클라이언트는 같은 ID·카운터·내용으로 재전송합니다.
 서버의 영속 처리 기록과 SHA-256이 일치하면 저장을 반복하지 않고 기존 결과를 반환합니다.
 처리 카운터는 사용자별 클라이언트 ID에 묶이며, 문서당 최대 4,096개를 보관합니다.
@@ -124,6 +136,20 @@ never persists voice state. `rtc_peers.peers[]` includes `voice_active` and
 Audio travels over WebRTC between opted-in users; existing `rtc_signal` forwards
 SDP/ICE to the specified room member. Canvas documents continue through the broker.
 
-## Active password session proof
+## VM 관리 작업 (2026-11-12)
 
-The internal-only `POST /internal/password-session` requires `X-Agora-Internal-Token`. The body has `canvas_id`, `user_id`, `connection_id`, and `proof`. It returns `{active: boolean}` only for a live non-RTC data socket belonging to that user and canvas with the exact per-connection proof. No JWT is issued here; Spring rechecks current canvas visibility, read access and the signed password grant revision before renewing it. Wall forwards this endpoint only through its internal HTTPS listener.
+연결된 캔버스의 VM 설정도 기존 WebSocket 요청/응답 채널을 사용합니다.
+`runtime_execute`의 `action: "manage"`와 `management` 객체를 보냅니다.
+지원 `management.action`: `settings_get`, `settings_set`, `resources_set`,
+`disk_set`, `java_dependencies`, `reset`.
+조회에는 읽기 권한, 변경에는 쓰기와 실행 권한이 모두 필요합니다.
+브로커가 검사하고 C++에서도 인증된 identity로 검사합니다.
+`management.canvasId`를 보내더라도 C++은 연결된 캔버스 ID로 덮어씁니다.
+VM 관리자가 작업별 필드와 옵션을 최종 검증합니다.
+응답은 `runtime_result`이며 기존 `request_id`와 일치합니다.
+
+노트북 요청의 `operation`은 `execute`(기본), `prepare`, `reset`입니다.
+실행은 기존 코드 셀 ID가 필요하고, 준비와 초기화는 노트북 객체 ID를 사용합니다.
+준비에는 쓰기와 실행 권한이 필요합니다.
+코드 및 stdin은 각각 UTF-8 65,536바이트 이하이며 JSON 요청 전체 상한은
+800,000바이트입니다. 이 상한은 JSON 이스케이프와 필드 메타데이터도 포함합니다.

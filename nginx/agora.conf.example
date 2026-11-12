@@ -78,6 +78,22 @@ server {
     # Internal application routes are never served on the published listener.
     location /internal/ { return 404; }
 
+    # Store large media as files; only playback metadata travels over the broker.
+    location ~ ^/api/canvases/[1-9][0-9]*/media(?:/|$) {
+        client_max_body_size 102m;
+        proxy_read_timeout 120s;
+        proxy_request_buffering off;
+        proxy_hide_header Strict-Transport-Security;
+        set $spring_host agora-spring;
+        proxy_ssl_name agora-spring;
+        proxy_pass https://$spring_host:8080;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Port $agora_public_port;
+    }
+
     # Dependency downloads have their own timeout; normal code remains bounded.
     location ~ ^/api/canvases/[1-9][0-9]*/runtime/(?:notebook|java/dependencies|build|execute/stream)$ {
         proxy_read_timeout 240s;
@@ -227,14 +243,24 @@ server {
     proxy_ssl_verify_depth 2;
     proxy_ssl_server_name on;
     proxy_ssl_protocols TLSv1.3;
-    location = /internal/broker/password-session {
-        set $password_broker agora-broker;
+    location = /internal/canvas/socket {
+        client_max_body_size 1m;
+        access_log off;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 60s;
+        set $canvas_service agora-spring;
+        proxy_ssl_name agora-spring;
+        proxy_pass https://$canvas_service:8080/internal/canvas/socket;
+        proxy_set_header X-Agora-Internal-Token $http_x_agora_internal_token;
+    }
+    location = /internal/broker/workspace-broadcast {
+        set $workspace_broker agora-broker;
         proxy_ssl_name ${BROKER_TLS_SERVER_NAME};
-        proxy_pass https://$password_broker:4443/internal/password-session;
+        proxy_pass https://$workspace_broker:4443/internal/workspace-broadcast;
         proxy_set_header X-Agora-Internal-Token $http_x_agora_internal_token;
         proxy_connect_timeout 2s;
         proxy_read_timeout 3s;
-        client_max_body_size 4k;
+        client_max_body_size 64k;
         access_log off;
     }
     location = /internal/search/embedding {
@@ -258,7 +284,11 @@ server {
         proxy_set_header X-Request-ID $http_x_request_id;
         proxy_set_header X-Forwarded-Proto https;
         proxy_connect_timeout 3s;
-        proxy_read_timeout 3s;
+        proxy_send_timeout 240s;
+        proxy_read_timeout 240s;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        client_max_body_size 256k;
         proxy_redirect off;
     }
     location / { return 404; }

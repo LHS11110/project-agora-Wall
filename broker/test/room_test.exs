@@ -86,16 +86,14 @@ defmodule AgoraBroker.RoomTest do
     %{room: room, canvas: canvas}
   end
 
-  test "password renewal requires a matching live canvas connection, user and proof", %{room: room, canvas: canvas} do
+  test "new public participant notifies existing canvas sessions", %{room: room, canvas: canvas} do
     :ok = Room.join(room, self(), client(false, canvas))
-    assert_receive {:deliver, %{"type" => "init_items", "rtc_canvas_connection_id" => id, "rtc_canvas_connection_hash" => proof}}
-    assert Room.password_session(canvas, 7, id, proof)
-    refute Room.password_session(canvas, 8, id, proof)
-    refute Room.password_session(canvas + 999999, 7, id, proof)
-    refute Room.password_session(canvas, 7, id, "wrong")
-    refute Room.password_session(canvas, 7, "wrong", proof)
-    Room.leave(room, self())
-    refute Room.password_session(canvas, 7, id, proof)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    joined = client(false, canvas)
+    pid = listener(room, %{joined | response: Map.put(joined.response, "participant_joined", true)})
+    assert_receive {:deliver, %{"type" => "canvas_participants_changed"}}
+    assert_receive {:frame, ^pid, %{"type" => "init_items"}}
+    send(pid, :stop)
   end
 
   defp client(rtc, canvas, group \\ "group") do
@@ -133,6 +131,50 @@ defmodule AgoraBroker.RoomTest do
       :stop ->
         :ok
     end
+  end
+
+  test "runtime management requires write plus execute, while readers may inspect settings", %{room: room, canvas: canvas} do
+    base = client(false, canvas)
+    :ok = Room.join(room, self(), base)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    assert {:error, "RUNTIME_EXECUTION_DENIED"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "manage", "management" => %{"action" => "disk_set", "sizeGiB" => 8, "revision" => 0}})
+    :ok = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "manage", "management" => %{"action" => "settings_get"}})
+    assert_receive {:query, input}
+    assert input["event"]["management"]["action"] == "settings_get"
+  end
+
+  test "individually valid code and stdin fit the shared runtime envelope", %{room: room, canvas: canvas} do
+    base = client(false, canvas)
+    :ok = Room.join(room, self(), %{base | identity: Map.put(base.identity, "execute_groups", ["group"])})
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    event = %{"type" => "runtime_execute", "action" => "execute", "language" => "python", "object_id" => "code", "code" => String.duplicate("x", 65_536), "stdin" => String.duplicate("y", 65_536)}
+    :ok = Room.submit(room, self(), event)
+    assert_receive {:query, input}
+    assert byte_size(input["event"]["stdin"]) == 65_536
+  end
+
+  test "canvas service manager actions stop at the broker for ordinary readers", %{room: room, canvas: canvas} do
+    :ok=Room.join(room,self(),client(false,canvas))
+    assert_receive {:deliver,%{"type"=>"init_items"}}
+    for path <- ["/bots", "/github/bind", "/people"] do
+      assert {:error,"RUNTIME_EXECUTION_DENIED"}=Room.submit(room,self(),%{"type"=>"runtime_execute","action"=>"service","service"=>%{"operation"=>"api","method"=>"POST","path"=>path}})
+    end
+    :ok=Room.submit(room,self(),%{"type"=>"runtime_execute","action"=>"service","service"=>%{"operation"=>"api","method"=>"GET","path"=>"/profiles/user/1"}})
+    assert_receive {:query,input}
+    assert input["event"]["service"]["path"]=="/profiles/user/1"
+  end
+
+  test "delta subscribers get patches only for already visible objects", %{room: room, canvas: canvas} do
+    :ok=Room.join(room,self(),client(false,canvas))
+    assert_receive {:deliver,%{"type"=>"init_items"}}
+    :ok=Room.submit(room,self(),%{"type"=>"canvas_sync","delta_commits"=>true})
+    assert_receive {:deliver,%{"type"=>"canvas_snapshot"}}
+    broadcast=%{"all"=>true,"event"=>%{"type"=>"canvas_commit","revision"=>1,"items"=>%{"known"=>%{"kind"=>"text","text"=>String.duplicate("x",20000)},"new"=>%{"kind"=>"text","text"=>"new"},"hidden"=>%{"kind"=>"text","text"=>"secret"}},"deltas"=>%{"known"=>[%{"op"=>"replace","path"=>"/x","value"=>2}],"new"=>[%{"op"=>"replace","path"=>"/text","value"=>"new"}],"hidden"=>[%{"op"=>"replace","path"=>"/text","value"=>"secret"}]}},"permissions"=>%{"known"=>["group"],"new"=>["group"],"hidden"=>["private"]},"previous_permissions"=>%{"known"=>["group"],"new"=>["private"],"hidden"=>["private"]}}
+    :ok=Room.submit(room,self(),%{"type"=>"canvas_ops","test_broadcasts"=>[broadcast]})
+    assert_receive {:deliver,%{"type"=>"canvas_commit"}=event}
+    assert Map.keys(event["patches"])==["known"]
+    assert Map.keys(event["items"])==["new"]
+    refute Map.has_key?(event,"deltas")
   end
 
   test "compiled bit masks stay internal while authenticated layout reaches C++", %{room: room, canvas: canvas} do

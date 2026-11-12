@@ -53,6 +53,9 @@ defmodule AgoraBroker.Policy do
   def receives?(identity, broadcast),
     do: broadcast["all"] == true or visible?(identity, broadcast["permission"])
 
+  def can_execute?(%{"is_admin" => true}), do: true
+  def can_execute?(identity), do: is_list(identity["execute_groups"]) and identity["execute_groups"] != []
+
   def elect(peers) do
     groups = peers |> Enum.flat_map(& &1["groups"]) |> Enum.uniq()
 

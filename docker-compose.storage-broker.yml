@@ -4,6 +4,11 @@ services:
     image: haproxy:3.2-alpine@sha256:5d97434a423c2533cfeb42874d45cf6d69a840b60334582dfbfd5008e94c80be
     container_name: agora-storage-broker
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     init: true
     read_only: true
     cap_drop: [ALL]

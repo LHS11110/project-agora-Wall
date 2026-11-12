@@ -5,6 +5,11 @@ services:
     image: nginx:stable-alpine
     container_name: agora-nginx
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     environment:
       FRONTEND_MODE: ${FRONTEND_MODE:-production}
       NGINX_TRUSTED_PROXY_IP: ${NGINX_TRUSTED_PROXY_IP:-127.0.0.1}

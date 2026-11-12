@@ -36,6 +36,7 @@ defmodule AgoraBroker.Socket do
                  identity:
                    Policy.compile(Map.merge(identity, %{
                      "canvas_id" => id,
+                     "client_ip" => client_ip,
                      "connection_id" => route["connection_id"],
                      "expires_at" => expiry
                    })),
