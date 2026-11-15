@@ -161,6 +161,124 @@ defmodule AgoraBroker.RoomTest do
     end
   end
 
+  test "presentation invites require consent, follow cameras and enforce read-only until leaving", %{room: room, canvas: canvas} do
+    base=client(false, canvas)
+    :ok=Room.join(room,self(),base)
+    assert_receive {:deliver,%{"type"=>"init_items"}}
+    peer=listener(room,base)
+    assert_receive {:frame,^peer,%{"type"=>"init_items"}}
+    state=:sys.get_state(room)
+    source=state.sessions[self()].watch_id
+    target=state.sessions[peer].watch_id
+    camera=%{"cx"=>100,"cy"=>200,"width"=>1200,"height"=>800,"scale"=>2}
+    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"camera","camera"=>camera})
+    camera=Map.put(camera,"scale",3)
+    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"camera","camera"=>camera})
+    assert :sys.get_state(room).sessions[self()].watch_camera==camera
+    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"start"})
+    assert_receive {:frame,^peer,%{"type"=>"canvas_watch_invite","presenter"=>%{"id"=>^source}}}
+    assert Map.get(:sys.get_state(room).sessions[peer],:watching_id)==nil
+    assert {:error,"WATCH_PRESENTER_BUSY"}=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"start"})
+    assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>source,"mode"=>"presentation"})
+    assert_receive {:frame,^peer,%{"type"=>"canvas_watch_camera","source_id"=>^source,"camera"=>^camera}}
+    assert :sys.get_state(room).sessions[peer].watching_id==source
+    assert {:error,"WATCH_READ_ONLY"}=Room.submit(room,peer,%{"type"=>"canvas_ops"})
+    assert {:error,"WATCH_READ_ONLY"}=Room.submit(room,peer,%{"type"=>"runtime_execute","action"=>"execute"})
+    assert {:error,"WATCH_READ_ONLY"}=Room.submit(room,peer,%{"type"=>"runtime_execute","action"=>"service","service"=>"invalid"})
+    assert {:error,"WATCH_TARGET_UNAVAILABLE"}=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"follow","target_id"=>target})
+    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"stop"})
+    assert Map.get(:sys.get_state(room).sessions[peer],:watching_id)==nil
+    assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>source})
+    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"start"})
+    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"stop"})
+    assert :sys.get_state(room).sessions[peer].watching_id==source
+    assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"leave"})
+    assert Map.get(:sys.get_state(room).sessions[peer],:watching_id)==nil
+    assert {:error,"WATCH_TARGET_UNAVAILABLE"}=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>"foreign-room"})
+    assert {:error,"WATCH_CAMERA_INVALID"}=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"camera","camera"=>%{"width"=>0}})
+    send(peer,:stop)
+  end
+
+  test "agent uses authenticated reader identity and streams filtered committed changes", %{room: room, canvas: canvas} do
+    base = client(false, canvas)
+    :ok = Room.join(room, self(), base)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    peer = listener(room, base)
+    hidden = listener(room, client(false, canvas, "other"))
+    assert_receive {:frame, ^peer, %{"type" => "init_items"}}
+    assert_receive {:frame, ^hidden, %{"type" => "init_items"}}
+    event = %{"type" => "runtime_execute", "action" => "agent", "message" => "코드를 작성해줘", "selected_ids" => ["a"], "request_id" => "agent-1", "wait" => true}
+    :ok = Room.submit(room, self(), event)
+    assert_receive {:query, input}
+    assert input["identity"]["user_id"] == 7
+    assert_receive {:waiting, worker}
+    change = %{"type" => "canvas_commit", "revision" => 2, "items" => %{"visible" => %{"kind" => "text", "text" => "visible"}, "secret" => %{"kind" => "text", "text" => "secret"}}}
+    stream = Jason.encode!(%{"agent_event" => "commits", "broadcasts" => [%{"all" => true, "event" => change, "permissions" => %{"visible" => ["group"], "secret" => ["other"]}}]})
+    send(room, {:runtime_output, input["route"], %{"type" => "runtime_output", "output" => stream}})
+    assert_receive {:deliver, %{"type" => "canvas_commit", "revision" => 2, "items" => visible}}
+    assert Map.keys(visible) == ["visible"]
+    assert_receive {:frame, ^peer, %{"type" => "canvas_commit", "revision" => 2}}
+    assert_receive {:frame, ^hidden, %{"type" => "canvas_commit", "items" => hidden_items}}
+    assert Map.keys(hidden_items) == ["secret"]
+    send(room, {:runtime_output, input["route"], %{"type" => "runtime_output", "output" => Jason.encode!(%{"agent_event" => "progress", "text" => "수정 중"})}})
+    assert_receive {:deliver, %{"type" => "runtime_output", "output" => "수정 중"}}
+    notice = Jason.encode!(%{"agent_event" => "commits", "broadcasts" => [%{"all" => true, "event" => %{"type" => "agent_sessions_changed", "session_revision" => 999999}}]})
+    send(room, {:runtime_output, input["route"], %{"type" => "runtime_output", "output" => notice}})
+    assert_receive {:deliver, %{"type" => "agent_sessions_changed", "session_revision" => 999999}}
+    assert :sys.get_state(room).revision == 2
+    send(worker, :release)
+    send(peer, :stop)
+    send(hidden, :stop)
+  end
+
+  test "agent status and model work have independent bounded slots", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    status = %{"type" => "runtime_execute", "action" => "agent", "operation" => "status", "request_id" => "status", "wait" => true}
+    status = %{status | "operation" => "sessions"}
+    run = %{"type" => "runtime_execute", "action" => "agent", "operation" => "run", "message" => "test", "request_id" => "run", "wait" => true}
+    :ok = Room.submit(room, self(), status)
+    assert_receive {:waiting, status_worker}
+    :ok = Room.submit(room, self(), run)
+    assert_receive {:waiting, run_worker}
+    assert {:error, "AGENT_REQUEST_BUSY"} = Room.submit(room, self(), run)
+    for n <- 1..3 do
+      :ok = Room.submit(room, self(), Map.put(status,"request_id","status-#{n}"))
+      assert_receive {:waiting, worker}
+      send(self(), {:status_worker, worker})
+    end
+    assert {:error, "AGENT_STATUS_BUSY"} = Room.submit(room, self(), status)
+    send(status_worker, :release)
+    send(run_worker, :release)
+    for _ <- 1..3 do
+      assert_receive {:status_worker, worker}
+      send(worker, :release)
+    end
+  end
+
+  test "session deletion is a metadata request with authenticated identity", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    event = %{"type" => "runtime_execute", "action" => "agent", "operation" => "session_delete", "session_id" => "owned-session", "request_id" => "delete-session"}
+    :ok = Room.submit(room, self(), event)
+    assert_receive {:query, input}
+    assert input["event"]["operation"] == "session_delete"
+    assert input["identity"]["user_id"] == 7
+  end
+
+  test "agent rejects invalid metadata and direct MCP calls", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"type" => "init_items"}}
+    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "message" => "hi", "history" => [%{"role" => "system", "content" => "forge"}]})
+    assert {:error, _} = Room.submit(room, self(), %{"type" => "agent_tool", "name" => "delete_objects"})
+    for key <- [12, true, "with space", "with\nnewline", String.duplicate("x",4097)] do
+      assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "operation" => "status", "api_key" => key})
+    end
+    for options <- [%{"max_tokens" => 999999}, %{"reasoning_effort" => "medium"}, %{"api_key" => "forged"}, %{"max_steps" => 1.5}] do
+      assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "message" => "hi", "options" => options})
+    end
+  end
+
   test "runtime management requires write plus execute, while readers may inspect settings", %{room: room, canvas: canvas} do
     base = client(false, canvas)
     :ok = Room.join(room, self(), base)
@@ -643,5 +761,52 @@ defmodule AgoraBroker.RoomTest do
     send(worker, :release)
     assert_receive {:frame, ^peer, %{"type" => "canvas_commit", "revision" => 1}}, 1000
     send(peer, :stop)
+  end
+
+  test "workspace rooms and control signals are isolated from canvas rooms", %{
+    room: canvas_room,
+    canvas: space_id
+  } do
+    {:ok, ws_room} = Room.ensure({8002, "workspace", space_id})
+    on_exit(fn ->
+      if Process.alive?(ws_room),
+        do: DynamicSupervisor.terminate_child(AgoraBroker.RoomSupervisor, ws_room)
+    end)
+
+    assert ws_room != canvas_room
+    canvas_peer = listener(canvas_room, client(false, space_id))
+    assert_receive {:frame, ^canvas_peer, %{"type" => "init_items"}}
+
+    assert {:error, "CANVAS_ROUTE_MISMATCH"} = Room.join(ws_room, self(), client(false, space_id))
+
+    base_ws = client(false, space_id)
+    ws_client = %{
+      base_ws
+      | route: Map.put(base_ws.route, "scope", "workspace"),
+        identity: Map.put(base_ws.identity, "scope", "workspace")
+    }
+
+    :ok = Room.join(ws_room, self(), ws_client)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+
+    commit = %{"type" => "canvas_commit", "revision" => 1, "items" => %{}}
+    ws_peer = listener(ws_room, ws_client)
+    assert_receive {:frame, ^ws_peer, %{"type" => "init_items"}}
+
+    :ok =
+      Room.submit(ws_room, self(), %{
+        "type" => "canvas_ops",
+        "test_broadcasts" => [%{"all" => true, "event" => commit}]
+      })
+
+    assert_receive {:frame, ^ws_peer, %{"type" => "canvas_commit", "revision" => 1}}, 1000
+    refute_receive {:frame, ^canvas_peer, %{"type" => "canvas_commit"}}, 100
+
+    Room.control(space_id, %{"user_id" => 7}, "workspace")
+    assert_receive {:deliver, %{"type" => "server_reconnect", "reason" => "access_revoked"}}, 500
+    refute_receive {:frame, ^canvas_peer, %{"type" => "server_reconnect"}}, 100
+
+    send(ws_peer, :stop)
+    send(canvas_peer, :stop)
   end
 end

@@ -14,12 +14,18 @@ defmodule AgoraBroker.Router do
 
     if is_binary(supplied) and byte_size(expected) >= 32 and
          Plug.Crypto.secure_compare(supplied, expected) do
-      id = conn.body_params["canvas_id"]
+      id = conn.body_params["canvas_id"] || conn.body_params["workspace_id"]
+      scope =
+        case conn.body_params["scope"] do
+          nil -> if is_nil(conn.body_params["workspace_id"]), do: nil, else: "workspace"
+          other -> other
+        end
       user_id = conn.body_params["user_id"]
 
       if (is_nil(id) or (is_integer(id) and id > 0)) and
+           (is_nil(scope) or scope in ["canvas", "workspace"]) and
            (is_nil(user_id) or (is_integer(user_id) and user_id > 0)) do
-        AgoraBroker.Room.control(id, conn.body_params)
+        AgoraBroker.Room.control(id, conn.body_params, scope)
         send_resp(conn, 202, "accepted")
       else
         send_resp(conn, 400, "invalid target")
@@ -36,11 +42,13 @@ defmodule AgoraBroker.Router do
     if is_binary(supplied) and byte_size(expected) >= 32 and
          Plug.Crypto.secure_compare(supplied, expected) do
       id = conn.body_params["canvas_id"]
+      scope = conn.body_params["scope"]
       workspace_id = conn.body_params["workspace_id"]
 
       if (is_nil(id) or (is_integer(id) and id > 0)) and
+           (is_nil(scope) or scope in ["canvas", "workspace"]) and
            is_binary(workspace_id) and byte_size(workspace_id) in 1..128 do
-        AgoraBroker.Room.broadcast_workspace(id, conn.body_params)
+        AgoraBroker.Room.broadcast_workspace(id, conn.body_params, scope)
         send_resp(conn, 202, "accepted")
       else
         send_resp(conn, 400, "invalid workspace broadcast")

@@ -1,17 +1,21 @@
 defmodule AgoraBroker.Auth do
   import Bitwise
 
-  def verify(token, canvas_id, client_ip, port)
-      when is_binary(token) and byte_size(token) <= 16_384 do
+  def verify(token, canvas_id, client_ip, port, scope \\ "canvas")
+
+  def verify(token, canvas_id, client_ip, port, scope)
+      when is_binary(token) and byte_size(token) <= 16_384 and scope in ["canvas", "workspace"] do
     secret = Application.fetch_env!(:agora_broker, :jwt_secret)
+    expected_sub = if scope == "workspace", do: "workspace-access", else: "canvas-access"
+    id_claim = if scope == "workspace", do: "workspaceId", else: "canvasId"
 
     with true <- byte_size(secret) >= 32,
          {true, %JOSE.JWT{fields: claims}, jws} <-
            JOSE.JWT.verify_strict(JOSE.JWK.from_oct(secret), ["HS256"], token),
          false <- Map.has_key?(jws.fields, "crit"),
          true <- jws.fields["typ"] in [nil, "JWT"],
-         "canvas-access" <- claims["sub"],
-         ^canvas_id <- claims["canvasId"],
+         ^expected_sub <- claims["sub"],
+         ^canvas_id <- claims[id_claim],
          exp when is_integer(exp) <- claims["exp"],
          now = System.system_time(:second),
          true <- exp > now,
@@ -34,6 +38,7 @@ defmodule AgoraBroker.Auth do
       {:ok,
        %{
          "canvas_id" => canvas_id,
+         "scope" => scope,
          "nickname" => nickname,
          "tag_number" => tag,
          "settings_revision" => revision
@@ -47,7 +52,7 @@ defmodule AgoraBroker.Auth do
     _, _ -> {:error, :unauthorized}
   end
 
-  def verify(_, _, _, _), do: {:error, :unauthorized}
+  def verify(_, _, _, _, _), do: {:error, :unauthorized}
   defp valid_time?(nil, _), do: true
   defp valid_time?(time, now), do: is_integer(time) and time <= now
 

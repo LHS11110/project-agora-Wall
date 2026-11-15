@@ -162,12 +162,14 @@ server {
     }
 
     # Logical C++ route ports are resolved by the broker allowlist.
-    location ~ ^/wss/port/(?<cpp_ws_port>80(?:0[2-9]|[1-9][0-9]))/(?<broker_channel>(?:rtc/)?canvas)/(?<broker_canvas_id>[0-9]+)$ {
+    location ~ ^/wss/port/(?<cpp_ws_port>80(?:0[2-9]|[1-9][0-9]))/(?<broker_channel>(?:rtc/)?(?:canvas|workspace))/(?<broker_canvas_id>[0-9]+)$ {
         set $broker_host agora-broker;
         set $broker_rtc false;
-        if ($broker_channel = "rtc/canvas") { set $broker_rtc true; }
+        set $broker_scope canvas;
+        if ($broker_channel ~ ^rtc/) { set $broker_rtc true; }
+        if ($broker_channel ~ workspace$) { set $broker_scope workspace; }
         proxy_ssl_name ${BROKER_TLS_SERVER_NAME};
-        proxy_pass https://$broker_host:4443/broker/websocket?canvas_id=$broker_canvas_id&ws_port=$cpp_ws_port&rtc=$broker_rtc&token=$arg_token&client_id=$arg_client_id&compression=$arg_compression;
+        proxy_pass https://$broker_host:4443/broker/websocket?canvas_id=$broker_canvas_id&scope=$broker_scope&ws_port=$cpp_ws_port&rtc=$broker_rtc&token=$arg_token&client_id=$arg_client_id&compression=$arg_compression;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "Upgrade";

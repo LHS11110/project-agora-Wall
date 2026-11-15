@@ -4,16 +4,29 @@ defmodule AgoraBroker.Socket do
   def child_spec(_), do: :ignore
 
   def connect(%{params: params, connect_info: info}) do
+    scope =
+      case params["scope"] do
+        value when value in [nil, ""] -> "canvas"
+        value -> value
+      end
+
     with {id, ""} when id > 0 <- Integer.parse(params["canvas_id"] || ""),
          {port, ""} <- Integer.parse(params["ws_port"] || ""),
+         true <- scope in ["canvas", "workspace"],
          token when is_binary(token) and byte_size(token) in 1..16_384 <- params["token"],
          true <- Map.has_key?(Application.get_env(:agora_broker, :targets, %{}), to_string(port)) do
       client_ip = client_ip(info)
 
-      route = %{"canvas_id" => id, "connection_id" => Policy.id(), "request_id" => Policy.id()}
+      route = %{
+        "canvas_id" => id,
+        "scope" => scope,
+        "connection_id" => Policy.id(),
+        "request_id" => Policy.id()
+      }
+
       backend = Application.get_env(:agora_broker, :backend, AgoraBroker.Backend)
 
-      with {:ok, principal, expiry} <- Auth.verify(token, id, client_ip, port) do
+      with {:ok, principal, expiry} <- Auth.verify(token, id, client_ip, port, scope) do
         case backend.connect(%{
                "principal" => principal,
                "include_items" => false,
@@ -36,6 +49,7 @@ defmodule AgoraBroker.Socket do
                  identity:
                    Policy.compile(Map.merge(identity, %{
                      "canvas_id" => id,
+                     "scope" => scope,
                      "client_ip" => client_ip,
                      "connection_id" => route["connection_id"],
                      "expires_at" => expiry
@@ -79,6 +93,7 @@ defmodule AgoraBroker.Socket do
 
   defp valid_identity?(identity, principal) when is_map(identity) do
     identity["canvas_id"] == principal["canvas_id"] and
+      (identity["scope"] || "canvas") == principal["scope"] and
       identity["nickname"] == principal["nickname"] and
       identity["tag_number"] == principal["tag_number"] and
       identity["settings_revision"] == principal["settings_revision"] and
@@ -91,7 +106,7 @@ defmodule AgoraBroker.Socket do
 
   def init(state) do
     if Map.get(state,:gzip,false), do: send(self(), :compression_ready)
-    {:ok, room} = Room.ensure({state.ws_port, state.route["canvas_id"]})
+    {:ok, room} = Room.ensure({state.ws_port, state.route["scope"] || "canvas", state.route["canvas_id"]})
     Process.monitor(room)
     :ok = Room.join(room, self(), state)
     Process.send_after(self(), :heartbeat, 20_000)

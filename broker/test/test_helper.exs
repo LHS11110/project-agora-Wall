@@ -10,6 +10,7 @@ defmodule AgoraBroker.TestBackend do
 
     identity = %{
       "canvas_id" => input["route"]["canvas_id"],
+      "scope" => input["route"]["scope"] || "canvas",
       "user_id" => 7,
       "nickname" => input["principal"]["nickname"],
       "tag_number" => input["principal"]["tag_number"],

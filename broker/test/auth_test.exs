@@ -117,4 +117,37 @@ defmodule AgoraBroker.AuthTest do
     assert {:ok, _} = Socket.connect(input)
     Application.delete_env(:agora_broker, :trusted_proxy_ips)
   end
+
+  test "workspace scope requires workspace-access JWT and workspaceId claim" do
+    ws_claims =
+      JwtFixture.claims()
+      |> Map.delete("canvasId")
+      |> Map.merge(%{"sub" => "workspace-access", "workspaceId" => 1})
+
+    canvas_token = JwtFixture.sign(JwtFixture.claims())
+    ws_token = JwtFixture.sign(ws_claims)
+
+    assert Auth.verify(canvas_token, 1, "127.0.0.1", 8002, "workspace") == {:error, :unauthorized}
+    assert Auth.verify(ws_token, 1, "127.0.0.1", 8002, "canvas") == {:error, :unauthorized}
+    assert Auth.verify(ws_token, 1, "127.0.0.1", 8002, "other") == {:error, :unauthorized}
+
+    assert {:ok, principal, _} = Auth.verify(ws_token, 1, "127.0.0.1", 8002, "workspace")
+    assert principal["canvas_id"] == 1
+    assert principal["scope"] == "workspace"
+
+    assert connect(canvas_token, "1", "workspace") == :error
+    assert connect(ws_token, "1", "canvas") == :error
+    assert {:ok, ws_state} = connect(ws_token, "1", "workspace")
+    assert_receive {:connect_query, input}
+    assert input["route"]["scope"] == "workspace"
+    assert ws_state.route["scope"] == "workspace"
+    assert ws_state.identity["scope"] == "workspace"
+  end
+
+  defp connect(token, canvas, scope) do
+    Socket.connect(%{
+      params: %{"canvas_id" => canvas, "scope" => scope, "ws_port" => "8002", "token" => token},
+      connect_info: %{peer_data: %{address: {127, 0, 0, 1}}, x_headers: []}
+    })
+  end
 end

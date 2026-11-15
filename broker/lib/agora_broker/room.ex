@@ -10,7 +10,9 @@ defmodule AgoraBroker.Room do
         name: {:via, Registry, {AgoraBroker.RoomRegistry, key}}
       )
 
-  def ensure(key) do
+  def ensure({port, canvas}), do: ensure({port, "canvas", canvas})
+
+  def ensure({_port, scope, _canvas} = key) when scope in ["canvas", "workspace"] do
     case Registry.lookup(AgoraBroker.RoomRegistry, key) do
       [{pid, _}] ->
         {:ok, pid}
@@ -34,23 +36,27 @@ defmodule AgoraBroker.Room do
     :exit, _ -> {:error, "QUERY_OUTCOME_UNKNOWN"}
   end
 
-  def control(id, command) do
-    for {{_port, canvas}, pid, _} <-
+  def control(id, command, scope \\ nil) do
+    target_scope = scope || command["scope"]
+
+    for {{_port, room_scope, canvas}, pid, _} <-
           Registry.select(AgoraBroker.RoomRegistry, [
             {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
           ]),
-        is_nil(id) or canvas == id,
+        (is_nil(id) or canvas == id) and (is_nil(target_scope) or room_scope == target_scope),
         do: GenServer.cast(pid, {:control, command})
 
     :ok
   end
 
-  def broadcast_workspace(id, payload) when is_map(payload) do
-    for {{_port, canvas}, pid, _} <-
+  def broadcast_workspace(id, payload, scope \\ nil) when is_map(payload) do
+    target_scope = scope || payload["scope"]
+
+    for {{_port, room_scope, canvas}, pid, _} <-
           Registry.select(AgoraBroker.RoomRegistry, [
             {{:"$1", :"$2", :"$3"}, [], [{{:"$1", :"$2", :"$3"}}]}
           ]),
-        is_nil(id) or canvas == id,
+        (is_nil(id) or canvas == id) and (is_nil(target_scope) or room_scope == target_scope),
         do: GenServer.cast(pid, {:workspace_broadcast, payload})
 
     :ok
@@ -77,10 +83,13 @@ defmodule AgoraBroker.Room do
   end
 
   def handle_call({:join, pid, client}, from, state) do
-    {port, canvas} = state.key
+    {port, scope, canvas} = state.key
+    client_scope = client.route["scope"] || "canvas"
+    identity_scope = client.identity["scope"] || "canvas"
 
     if client.ws_port == port and client.route["canvas_id"] == canvas and
-         client.identity["canvas_id"] == canvas do
+         client.identity["canvas_id"] == canvas and
+         client_scope == scope and identity_scope == scope do
       join_client(pid, client, from, state)
     else
       {:reply, {:error, "CANVAS_ROUTE_MISMATCH"}, state}
@@ -103,6 +112,7 @@ defmodule AgoraBroker.Room do
         pid: pid,
         proof: hash,
         peer_id: nil,
+        watch_id: Policy.id(),
         bound: nil,
         voice_active: false,
         voice_muted: false,
@@ -330,6 +340,8 @@ defmodule AgoraBroker.Room do
     end
   end
 
+  defp handle_event(%{rtc: false} = client, %{"type" => "canvas_watch"} = event, state), do: AgoraBroker.CanvasWatch.handle(client, event, state)
+
   defp handle_event(%{rtc: true}, _, state), do: {:reply, {:error, "RTC_SIGNAL_INVALID"}, state}
 
   defp handle_event(client, event, state) do
@@ -339,6 +351,9 @@ defmodule AgoraBroker.Room do
     state = if Map.has_key?(state.sessions, client.pid), do: put_in(state.sessions[client.pid], client), else: state
 
     cond do
+      AgoraBroker.CanvasWatch.blocked?(client, event) ->
+        {:reply, {:error, "WATCH_READ_ONLY"}, state}
+
       type not in [
         "canvas_ops",
         "canvas_sync",
@@ -388,7 +403,8 @@ defmodule AgoraBroker.Room do
             {:reply, {:error, "RUNTIME_REQUEST_TOO_LARGE"}, state}
 
           type == "runtime_execute" and runtime_busy?(event, state) ->
-            {:reply, {:error, "RUNTIME_BUSY"}, state}
+            code = if event["action"] == "agent", do: (if event["operation"] in ["status", "sessions", "session_get", "session_delete"], do: "AGENT_STATUS_BUSY", else: "AGENT_REQUEST_BUSY"), else: "RUNTIME_BUSY"
+            {:reply, {:error, code}, state}
 
           type == "runtime_execute" ->
             {:reply, :ok, start_runtime_request(client, event, state)}
@@ -427,9 +443,14 @@ defmodule AgoraBroker.Room do
     end
   end
 
+  defp runtime_category(%{"action" => "agent", "operation" => operation}) when operation in ["status", "sessions", "session_get", "session_delete"], do: "agent_status"
+  defp runtime_category(%{"action" => action}) when action in ["agent", "service"], do: action
+  defp runtime_category(_), do: "vm"
+
   defp runtime_busy?(event,state) do
-    service=event["action"]=="service"
-    Enum.count(state.runtime_tasks,fn {_,entry}->(entry.event["action"]=="service")==service end)>=(if service,do: 4,else: 1)
+    kind = runtime_category(event)
+    limit = if kind in ["service", "agent_status"], do: 4, else: 1
+    Enum.count(state.runtime_tasks, fn {_,entry} -> runtime_category(entry.event) == kind end) >= limit
   end
 
   defp workspace_files_allowed?(identity, event, size) do
@@ -438,6 +459,10 @@ defmodule AgoraBroker.Room do
     allowed and size <= 700_000 and
       (identity["is_admin"] == true or
         ((identity["groups"] || []) != [] and (read or (identity["write_groups"] || []) != [])))
+  end
+
+  defp runtime_allowed?(identity, %{"action" => "agent"}) do
+    identity["is_admin"] == true or (identity["groups"] || []) != []
   end
 
   defp runtime_allowed?(identity, event) do
@@ -454,6 +479,37 @@ defmodule AgoraBroker.Room do
       Policy.can_execute?(identity) and (not manage or identity["is_admin"] == true or (identity["write_groups"] || []) != [])
     end
   end
+  end
+
+  defp agent_options_valid?(options) when is_map(options) do
+    Enum.all?(options, fn
+      {"reasoning_effort", value} -> value in ["low", "high", "max"]
+      {"max_tokens", value} -> is_integer(value) and value in 512..32768
+      {"max_steps", value} -> is_integer(value) and value in 1..12
+      {"temperature", value} -> is_number(value) and value >= 0 and value <= 2
+      {"top_p", value} -> is_number(value) and value >= 0.05 and value <= 1
+      _ -> false
+    end)
+  end
+  defp agent_options_valid?(_), do: false
+
+  defp runtime_request_valid?(%{"action" => "agent"} = event) do
+    is_binary(Map.get(event, "api_key", "")) and byte_size(Map.get(event, "api_key", "")) <= 4096 and
+      String.match?(Map.get(event, "api_key", ""), ~r/\A[\x21-\x7e]*\z/) and
+    agent_options_valid?(Map.get(event, "options", %{})) and
+    event["operation"] in [nil, "run", "status", "sessions", "session_get", "session_delete"] and
+      (is_nil(event["session_id"]) or (is_binary(event["session_id"]) and byte_size(event["session_id"]) in 1..128)) and
+      (is_nil(event["turn_id"]) or (is_binary(event["turn_id"]) and byte_size(event["turn_id"]) in 1..128)) and
+      event["include_history"] in [nil,true,false] and
+      (is_nil(event["offset"]) or (is_integer(event["offset"]) and event["offset"] in 0..10000000)) and
+      (is_nil(event["before"]) or (is_integer(event["before"]) and event["before"] >= 0)) and
+      (is_nil(event["limit"]) or (is_integer(event["limit"]) and event["limit"] in 1..100)) and
+      (event["operation"] in ["status", "sessions", "session_get", "session_delete"] or (is_binary(event["message"]) and byte_size(event["message"]) in 1..24_000)) and
+      is_list(event["selected_ids"] || []) and length(event["selected_ids"] || []) <= 20 and
+      Enum.all?(event["selected_ids"] || [], fn id -> is_binary(id) and byte_size(id) in 1..128 end) and
+      is_list(event["history"] || []) and length(event["history"] || []) <= 12 and
+      Enum.all?(event["history"] || [], fn h -> is_map(h) and h["role"] in ["user", "assistant"] and is_binary(h["content"]) and byte_size(h["content"]) <= 24_000 end) and
+      event["allow_delete"] in [nil, true, false]
   end
 
   defp runtime_request_valid?(event) do
@@ -709,15 +765,27 @@ defmodule AgoraBroker.Room do
       when is_binary(output) do
     entry = Enum.find_value(state.runtime_tasks, fn {_ref, task} -> if task.route == route, do: task end)
 
-    if entry && Map.has_key?(state.sessions, entry.client.pid) do
-      deliver(entry.client.pid, %{
-        "type" => "runtime_output",
-        "request_id" => entry.event["request_id"],
-        "output" => output
-      })
+    if entry && entry.event["action"] == "agent" do
+      case Jason.decode(output) do
+        {:ok, %{"agent_event" => "commits", "broadcasts" => broadcasts}} when is_list(broadcasts) ->
+          for broadcast <- broadcasts,
+              {pid, client} <- state.sessions,
+              not client.rtc and Policy.receives?(client.identity, broadcast) do
+            deliver(pid, filtered_event(broadcast, client.identity))
+          end
+          revision = Enum.reduce(broadcasts, state.revision, fn b, r -> max(r, get_in(b, ["event", "revision"]) || 0) end)
+          {:noreply, %{state | revision: revision}}
+        {:ok, %{"agent_event" => "progress", "text" => text}} when is_binary(text) ->
+          if Map.has_key?(state.sessions, entry.client.pid), do: deliver(entry.client.pid, %{"type" => "runtime_output", "request_id" => entry.event["request_id"], "output" => text})
+          {:noreply, state}
+        _ -> {:noreply, state}
+      end
+    else
+      if entry && Map.has_key?(state.sessions, entry.client.pid) do
+        deliver(entry.client.pid, %{"type" => "runtime_output", "request_id" => entry.event["request_id"], "output" => output})
+      end
+      {:noreply, state}
     end
-
-    {:noreply, state}
   end
 
   def handle_info({:DOWN, ref, :process, _pid, _reason}, %{runtime_tasks: runtime_tasks} = state)
@@ -1031,7 +1099,7 @@ defmodule AgoraBroker.Room do
         client.bound == pid,
         do: send(other, {:close, :canvas_socket_closed})
 
-    %{state | sessions: Map.delete(state.sessions, pid)}
+    AgoraBroker.CanvasWatch.reconcile(%{state | sessions: Map.delete(state.sessions, pid)})
   end
 
   defp detach(pid, state) do
@@ -1040,7 +1108,8 @@ defmodule AgoraBroker.Room do
         state = %{
           state
           | peers: Map.delete(state.peers, id),
-            sessions: Map.put(state.sessions, pid, %{client | peer_id: nil, bound: nil})
+            sessions: Map.put(state.sessions, pid, %{client | peer_id: nil,
+        watch_id: Policy.id(), bound: nil})
         }
 
         for {_id, other} <- state.peers,

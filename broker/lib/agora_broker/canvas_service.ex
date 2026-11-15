@@ -2,7 +2,7 @@ defmodule AgoraBroker.CanvasService do
   # Fixed internal destination, TLS verification and a route-bound identity.
   def query(input) do
     identity=input["identity"]
-    payload=Jason.encode!(%{"canvasId"=>input["route"]["canvas_id"],"userId"=>identity["user_id"],"clientIp"=>identity["client_ip"],"request"=>input["event"]["service"]})
+    payload=Jason.encode!(%{"canvasId"=>input["route"]["canvas_id"],"scope"=>input["route"]["scope"]||"canvas","userId"=>identity["user_id"],"clientIp"=>identity["client_ip"],"request"=>input["event"]["service"]})
     token=Application.fetch_env!(:agora_broker,:internal_token)
     options=%{transport: :tls, protocols: [:http], tls_opts: [verify: :verify_peer, versions: [:"tlsv1.3"], cacertfile: ~c"/run/tls/ca.pem", server_name_indication: ~c"agora-nginx", customize_hostname_check: [match_fun: :public_key.pkix_verify_hostname_match_fun(:https)]]}
     with {:ok,conn} <- :gun.open(~c"agora-nginx",8444,options) do
