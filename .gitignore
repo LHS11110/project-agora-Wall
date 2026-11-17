@@ -68,3 +68,5 @@ playwright-report/
 *.sql.gz
 *.rdb
 appendonlydir/
+
+.local-media/

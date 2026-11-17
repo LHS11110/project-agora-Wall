@@ -122,6 +122,8 @@ def prepare(tls_dir, public_origin, backend_ip, backend_dir=None, broker_tls_dir
     for name in ('fullchain.pem', 'privkey.pem'):
         if not (broker_tls / name).is_file(): raise ValueError(f'Missing broker certificate: {broker_tls / name}')
     values.update(CPP_INTERNAL_API_TOKEN=token,
+                  MEDIA_RELAY_SECRET=values.get('MEDIA_RELAY_SECRET') or secrets.token_urlsafe(48),
+                  MEDIA_RELAY_URLS=values.get('MEDIA_RELAY_URLS') or '["turns:frelog.p-e.kr:443?transport=tcp"]',
                   BROKER_SECRET_KEY_BASE=values.get('BROKER_SECRET_KEY_BASE') or secrets.token_urlsafe(64),
                   BROKER_TLS_CERT_DIR=str(broker_tls),
                   BROKER_TLS_SERVER_NAME='agora-broker' if broker_tls_dir else 'agora-nginx',

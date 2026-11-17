@@ -1,5 +1,2 @@
-* text=auto
-*.sh text eol=lf
-*.py text eol=lf
-*.yml text eol=lf
-*.conf.example text eol=lf
+# Preserve the pinned upstream license verbatim.
+media/COTURN-LICENSE -text -whitespace

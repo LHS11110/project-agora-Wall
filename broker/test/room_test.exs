@@ -161,7 +161,7 @@ defmodule AgoraBroker.RoomTest do
     end
   end
 
-  test "presentation invites require consent, follow cameras and enforce read-only until leaving", %{room: room, canvas: canvas} do
+  test "manual watch follows cameras, enforces read-only and rejects presentation requests", %{room: room, canvas: canvas} do
     base=client(false, canvas)
     :ok=Room.join(room,self(),base)
     assert_receive {:deliver,%{"type"=>"init_items"}}
@@ -175,23 +175,15 @@ defmodule AgoraBroker.RoomTest do
     camera=Map.put(camera,"scale",3)
     assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"camera","camera"=>camera})
     assert :sys.get_state(room).sessions[self()].watch_camera==camera
-    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"start"})
-    assert_receive {:frame,^peer,%{"type"=>"canvas_watch_invite","presenter"=>%{"id"=>^source}}}
-    assert Map.get(:sys.get_state(room).sessions[peer],:watching_id)==nil
-    assert {:error,"WATCH_PRESENTER_BUSY"}=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"start"})
-    assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>source,"mode"=>"presentation"})
+    assert {:error,"WATCH_REQUEST_INVALID"}=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"start"})
+    assert {:error,"WATCH_REQUEST_INVALID"}=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"stop"})
+    assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>source})
     assert_receive {:frame,^peer,%{"type"=>"canvas_watch_camera","source_id"=>^source,"camera"=>^camera}}
     assert :sys.get_state(room).sessions[peer].watching_id==source
     assert {:error,"WATCH_READ_ONLY"}=Room.submit(room,peer,%{"type"=>"canvas_ops"})
     assert {:error,"WATCH_READ_ONLY"}=Room.submit(room,peer,%{"type"=>"runtime_execute","action"=>"execute"})
     assert {:error,"WATCH_READ_ONLY"}=Room.submit(room,peer,%{"type"=>"runtime_execute","action"=>"service","service"=>"invalid"})
     assert {:error,"WATCH_TARGET_UNAVAILABLE"}=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"follow","target_id"=>target})
-    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"stop"})
-    assert Map.get(:sys.get_state(room).sessions[peer],:watching_id)==nil
-    assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>source})
-    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"start"})
-    assert :ok=Room.submit(room,self(),%{"type"=>"canvas_watch","action"=>"stop"})
-    assert :sys.get_state(room).sessions[peer].watching_id==source
     assert :ok=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"leave"})
     assert Map.get(:sys.get_state(room).sessions[peer],:watching_id)==nil
     assert {:error,"WATCH_TARGET_UNAVAILABLE"}=Room.submit(room,peer,%{"type"=>"canvas_watch","action"=>"follow","target_id"=>"foreign-room"})
@@ -517,6 +509,11 @@ defmodule AgoraBroker.RoomTest do
     assert {:error, "RTC_SIGNAL_INVALID"} = Room.submit(room, rtc, %{"type" => "voice_state", "active" => true, "muted" => false})
     :ok = Room.submit(room, rtc, %{"type" => "rtc_join", "canvas_protocol" => 2, "canvas_transport" => "broker-v1", "canvas_connection_id" => connection, "canvas_connection_hash" => proof})
     assert_receive {:frame, ^rtc, %{"type" => "rtc_peers", "self_peer_id" => peer}}
+    :ok = Room.submit(room, rtc, %{"type" => "rtc_list"})
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_peers"} = heartbeat}
+    refute Map.has_key?(heartbeat, "media_relay"), "periodic peer lists must not restart ICE"
+    :ok = Room.submit(room, rtc, %{"type" => "rtc_media_config"})
+    assert_receive {:frame, ^rtc, %{"type" => "rtc_media_config", "media_relay" => %{"ice_transport_policy" => "relay"}}}
     :ok = Room.submit(room, rtc, %{"type" => "voice_state", "peer_id" => "spoofed", "active" => true, "muted" => true})
     assert_receive {:frame, ^rtc, %{"type" => "voice_state", "peer_id" => ^peer, "active" => true, "muted" => true}}
     other = listener(room, client(true, canvas))
@@ -808,5 +805,80 @@ defmodule AgoraBroker.RoomTest do
 
     send(ws_peer, :stop)
     send(canvas_peer, :stop)
+  end
+
+  test "voice notification events reach only other voice-connected peers", %{
+    room: room,
+    canvas: canvas
+  } do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"rtc_canvas_connection_id" => connection, "rtc_canvas_connection_hash" => proof}}
+
+    join_rtc = fn ->
+      pid = listener(room, client(true, canvas))
+      assert_receive {:frame, ^pid, %{"type" => "rtc_ready"}}
+      :ok = Room.submit(room, pid, %{
+        "type" => "rtc_join",
+        "canvas_protocol" => 2,
+        "canvas_transport" => "broker-v1",
+        "canvas_connection_id" => connection,
+        "canvas_connection_hash" => proof
+      })
+      assert_receive {:frame, ^pid, %{"type" => "rtc_peers", "self_peer_id" => peer_id}}
+      {pid, peer_id}
+    end
+
+    {sender, sender_id} = join_rtc.()
+    {voice_peer, voice_peer_id} = join_rtc.()
+    {idle_peer, _idle_id} = join_rtc.()
+
+    # Connected peer joins voice first so it receives subsequent notices.
+    :ok = Room.submit(room, voice_peer, %{"type" => "voice_state", "active" => true, "muted" => false})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_state", "peer_id" => ^voice_peer_id, "active" => true}}
+    refute_receive {:frame, ^voice_peer, %{"type" => "voice_notice"}}, 30
+    refute_receive {:frame, ^idle_peer, %{"type" => "voice_notice"}}, 30
+
+    # Sender joins voice -> voice_peer hears voice_join; sender and idle_peer do not.
+    :ok = Room.submit(room, sender, %{"type" => "voice_state", "active" => true, "muted" => false})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "voice_join", "peer_id" => ^sender_id}}
+    refute_receive {:frame, ^sender, %{"type" => "voice_notice"}}, 30
+    refute_receive {:frame, ^idle_peer, %{"type" => "voice_notice"}}, 30
+
+    # Mute toggle emits no notice.
+    :ok = Room.submit(room, sender, %{"type" => "voice_state", "active" => true, "muted" => true})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_state", "peer_id" => ^sender_id, "muted" => true}}
+    refute_receive {:frame, ^voice_peer, %{"type" => "voice_notice"}}, 30
+
+    # Screen share start -> stop.
+    :ok = Room.submit(room, sender, %{"type" => "voice_state", "active" => true, "muted" => true, "screen_sharing" => true})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "screen_share_start", "peer_id" => ^sender_id}}
+    refute_receive {:frame, ^sender, %{"type" => "voice_notice"}}, 30
+    refute_receive {:frame, ^idle_peer, %{"type" => "voice_notice"}}, 30
+
+    :ok = Room.submit(room, sender, %{"type" => "voice_state", "active" => true, "muted" => true, "screen_sharing" => false})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "screen_share_stop", "peer_id" => ^sender_id}}
+    refute_receive {:frame, ^sender, %{"type" => "voice_notice"}}, 30
+    refute_receive {:frame, ^idle_peer, %{"type" => "voice_notice"}}, 30
+
+    # Explicit voice leave emits voice_leave.
+    :ok = Room.submit(room, sender, %{"type" => "voice_state", "active" => false, "muted" => false, "screen_sharing" => false})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "voice_leave", "peer_id" => ^sender_id}}
+    refute_receive {:frame, ^sender, %{"type" => "voice_notice"}}, 30
+    refute_receive {:frame, ^idle_peer, %{"type" => "voice_notice"}}, 30
+
+    # Duplicate leave or idle disconnect emits nothing.
+    :ok = Room.submit(room, idle_peer, %{"type" => "rtc_disconnect"})
+    assert_receive {:frame, ^voice_peer, %{"type" => "rtc_peer_left"}}
+    refute_receive {:frame, ^voice_peer, %{"type" => "voice_notice"}}, 30
+
+    # Abrupt disconnect while voice_active emits voice_leave to remaining voice peers.
+    :ok = Room.submit(room, sender, %{"type" => "voice_state", "active" => true, "muted" => false, "screen_sharing" => true})
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "voice_join", "peer_id" => ^sender_id}}
+    :ok = Room.submit(room, sender, %{"type" => "rtc_disconnect"})
+    assert_receive {:frame, ^voice_peer, %{"type" => "rtc_peer_left", "peer_id" => ^sender_id}}
+    assert_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "voice_leave", "peer_id" => ^sender_id}}
+    refute_receive {:frame, ^voice_peer, %{"type" => "voice_notice", "event" => "screen_share_stop"}}, 30
+
+    for pid <- [sender, voice_peer, idle_peer], do: send(pid, :stop)
   end
 end

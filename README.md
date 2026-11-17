@@ -163,3 +163,5 @@ Spring·C++의 MS SQL·Elasticsearch·Redis/Sentinel 연결은 Wall의 TCP 저�
 RTC 가입은 `canvas_protocol: 2`, `canvas_transport: "broker-v1"`과 데이터 소켓의 연결 증명을 사용합니다.
 `canvas_relay`는 커서·레이저·편집 상태 전용이며, P2P는 통화 미디어에만 사용합니다.
 이전 탭은 새로고침해야 합니다. [상세 프로토콜](BROKER_PROTOCOL.md).
+
+통화·화면·시스템 오디오는 Wall의 인증된 TURN/TLS 중계를 이용합니다. 443 포트 분기, 인증서, Orchestra 시작 순서와 실제 미디어 검증은 [Wall 미디어 중계](media/README.md)를 참고하세요.

@@ -30,3 +30,5 @@ __pycache__/
 **/service-account*.json
 **/application_default_credentials.json
 **/.ssh/
+
+.local-media/

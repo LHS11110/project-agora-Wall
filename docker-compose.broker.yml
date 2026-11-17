@@ -18,6 +18,8 @@ services:
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     environment:
+      MEDIA_RELAY_SECRET: ${MEDIA_RELAY_SECRET:?Configure Wall media relay secret}
+      MEDIA_RELAY_URLS: ${MEDIA_RELAY_URLS:-["turns:frelog.p-e.kr:443?transport=tcp"]}
       SERVICE_TLS_CERT: /run/tls/fullchain.pem
       SERVICE_TLS_KEY: /run/tls/privkey.pem
       SERVICE_TLS_CA: /run/tls/ca.pem

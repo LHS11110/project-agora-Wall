@@ -136,11 +136,15 @@ normal server-authoritative `canvas_ops`; code nodes do not independently execut
 
 ### Canvas voice calls
 
-Authenticated RTC members may submit `{type:"voice_state",active:boolean,muted:boolean}`.
+Authenticated RTC members may submit `{type:"voice_state",active:boolean,muted:boolean,screen_sharing?:boolean}`.
 The broker broadcasts the normalized state with its authenticated `peer_id` to this
 canvas only. It ignores a caller-supplied peer ID, rejects unjoined sockets, and
-never persists voice state. `rtc_peers.peers[]` includes `voice_active` and
-`voice_muted` for late joiners. Disconnect removes the RTC member normally.
+never persists voice state. `rtc_peers.peers[]` includes `voice_active`,
+`voice_muted`, and `screen_sharing` for late joiners. Disconnect removes the RTC
+member normally. Genuine voice membership or screen-share transitions (`voice_join`,
+`voice_leave`, `screen_share_start`, `screen_share_stop`) also emit
+`{type:"voice_notice",event:string,peer_id:string}` exclusively to other peers
+currently marked `voice_active: true`.
 Audio travels over WebRTC between opted-in users; existing `rtc_signal` forwards
 SDP/ICE to the specified room member. Canvas documents continue through the broker.
 
@@ -161,3 +165,7 @@ VM 관리자가 작업별 필드와 옵션을 최종 검증합니다.
 준비에는 쓰기와 실행 권한이 필요합니다.
 코드 및 stdin은 각각 UTF-8 65,536바이트 이하이며 JSON 요청 전체 상한은
 800,000바이트입니다. 이 상한은 JSON 이스케이프와 필드 메타데이터도 포함합니다.
+
+### RTC media relay configuration
+
+An authenticated, canvas-bound `rtc_peers` response includes `media_relay: {ice_transport_policy: "relay", ice_servers: [{urls, username, credential}], expires_at}`. `expires_at` is Unix seconds. Only the bound RTC connection may request `{"type":"rtc_media_config"}`; the response carries the same `media_relay` shape with renewed credentials. An empty `ice_servers` list means unavailable, never permission to fall back to direct peer media. See `media/README.md`.

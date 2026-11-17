@@ -34,12 +34,10 @@ defmodule AgoraBroker.CanvasWatch do
     action = event["action"]
     target = Enum.find_value(users(state), fn {_, c} -> if id(c) == event["target_id"], do: c end)
     followers = Enum.any?(users(state), fn {_, c} -> Map.get(c, :watching_id) == id(client) end)
-    presenter = Enum.find_value(users(state), fn {_, c} -> if Map.get(c, :presenting, false) and c.pid != client.pid, do: c end)
     cond do
       state.refresh_pending > 0 -> {:reply, {:error, "WATCH_RECONNECTING"}, state}
       action == "list" ->
         state = sync(state)
-        if presenter, do: deliver(client.pid, %{"type" => "canvas_watch_invite", "presenter" => frame(presenter)})
         {:reply, :ok, state}
       action == "camera" and not camera?(event["camera"]) -> {:reply, {:error, "WATCH_CAMERA_INVALID"}, state}
       action == "camera" ->
@@ -53,26 +51,13 @@ defmodule AgoraBroker.CanvasWatch do
           {:reply, :ok, put(state, c)}
         end
       action == "follow" and (is_nil(target) or target.pid == client.pid or Map.get(target, :watching_id) != nil) -> {:reply, {:error, "WATCH_TARGET_UNAVAILABLE"}, state}
-      action == "follow" and (followers or Map.get(client, :presenting, false)) -> {:reply, {:error, "WATCH_HAS_FOLLOWERS"}, state}
-      action == "follow" and event["mode"] == "presentation" and not Map.get(target, :presenting, false) -> {:reply, {:error, "WATCH_TARGET_UNAVAILABLE"}, state}
+      action == "follow" and followers -> {:reply, {:error, "WATCH_HAS_FOLLOWERS"}, state}
       action == "follow" ->
-        c = client |> Map.put(:watching_id, id(target)) |> Map.put(:watch_kind, if(event["mode"] == "presentation", do: "presentation", else: "manual")) |> Map.put(:watch_end_reason, nil)
+        c = client |> Map.put(:watching_id, id(target)) |> Map.put(:watch_kind, "manual") |> Map.put(:watch_end_reason, nil)
         state = sync(put(state, c));emit_camera(client.pid, target)
         deliver(target.pid, %{"type" => "canvas_watch_camera_requested"})
         {:reply, :ok, state}
       action == "leave" -> {:reply, :ok, sync(put(state, client |> Map.put(:watching_id, nil) |> Map.put(:watch_end_reason, "left")))}
-      action == "start" and not is_nil(presenter) -> {:reply, {:error, "WATCH_PRESENTER_BUSY"}, state}
-      action == "start" ->
-        c = client |> Map.put(:presenting, true) |> Map.put(:watching_id, nil)
-        if not Map.get(client, :presenting, false), do: (for {pid, _} <- users(state), pid != client.pid, do: deliver(pid, %{"type" => "canvas_watch_invite", "presenter" => frame(c)}))
-        {:reply, :ok, sync(put(state, c))}
-      action == "stop" ->
-        sessions = Map.new(state.sessions, fn {pid, c} -> {pid, cond do
-          pid == client.pid -> Map.put(c, :presenting, false)
-          Map.get(c, :watching_id) == id(client) and Map.get(c, :watch_kind) == "presentation" -> c |> Map.put(:watching_id, nil) |> Map.put(:watch_end_reason, "presentation_ended")
-          true -> c
-        end} end)
-        {:reply, :ok, sync(%{state | sessions: sessions})}
       true -> {:reply, {:error, "WATCH_REQUEST_INVALID"}, state}
     end
   end

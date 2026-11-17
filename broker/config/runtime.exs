@@ -7,6 +7,12 @@ if config_env() != :test do
     value
   end
 
+  relay_secret = required.("MEDIA_RELAY_SECRET")
+  relay_urls = Jason.decode!(System.fetch_env!("MEDIA_RELAY_URLS"))
+  if not is_list(relay_urls) or relay_urls == [] or Enum.any?(relay_urls, fn url -> not is_binary(url) or not String.starts_with?(url, "turns:") end),
+    do: raise("MEDIA_RELAY_URLS must be a non-empty list of TLS TURN URLs")
+  config :agora_broker, :media_relay, %{secret: relay_secret, urls: relay_urls}
+
   token = required.("CPP_INTERNAL_API_TOKEN")
 
   if not Regex.match?(~r/^[\x21-\x7E]+$/, token),

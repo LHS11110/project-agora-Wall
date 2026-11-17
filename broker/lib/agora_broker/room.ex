@@ -172,6 +172,11 @@ defmodule AgoraBroker.Room do
 
   defp handle_event(_client, %{"type" => "pong"}, state), do: {:reply, :ok, state}
 
+  defp handle_event(%{rtc: true, bound: bound} = client, %{"type" => "rtc_media_config"}, state) when not is_nil(bound) do
+    deliver(client.pid, %{"type" => "rtc_media_config", "media_relay" => AgoraBroker.MediaRelay.config(client.identity)})
+    {:reply, :ok, state}
+  end
+
   defp handle_event(%{rtc: true} = client, %{"type" => "rtc_join"} = event, state) do
     bound =
       Enum.find_value(state.sessions, fn {pid, candidate} ->
@@ -221,7 +226,7 @@ defmodule AgoraBroker.Room do
               peers: Map.put(state.peers, id, client.pid)
           }
 
-        list_peers(client, state)
+        list_peers(client, state, true)
         public = voice_public(client, id)
 
         for {_id, pid} <- state.peers,
@@ -251,7 +256,10 @@ defmodule AgoraBroker.Room do
        )
        when is_binary(id) and is_boolean(active) and is_boolean(muted) do
     sharing = Map.get(event, "screen_sharing", false)
-    client = %{client | voice_active: active, voice_muted: active and muted, screen_sharing: active and sharing == true}
+    prev_active = Map.get(client, :voice_active, false)
+    prev_sharing = Map.get(client, :screen_sharing, false)
+    next_sharing = active and sharing == true
+    client = %{client | voice_active: active, voice_muted: active and muted, screen_sharing: next_sharing}
     state = %{state | sessions: Map.put(state.sessions, client.pid, client)}
 
     for {_id, pid} <- state.peers,
@@ -263,6 +271,9 @@ defmodule AgoraBroker.Room do
             "muted" => client.voice_muted,
             "screen_sharing" => client.screen_sharing
           })
+
+    for notice <- voice_notices(prev_active, prev_sharing, active, next_sharing),
+        do: broadcast_voice_notice(state, client.pid, id, notice)
 
     {:reply, :ok, state}
   end
@@ -703,9 +714,9 @@ defmodule AgoraBroker.Room do
             if result["refresh_sessions"] == true do
               state = %{state | settings_revision: response["settings"]["settings_revision"]}
 
-              if result["refresh_items"] == true do
+              if result["refresh_items"] == true or result["refresh_access"] == true do
                 clients = for {_pid, client} <- state.sessions, not client.rtc, do: client
-                enqueue_access_refresh(state, clients, true)
+                enqueue_access_refresh(state, clients, result["refresh_items"] == true)
               else
                 update_settings_in_place(state, response["settings"])
               end
@@ -1105,21 +1116,60 @@ defmodule AgoraBroker.Room do
   defp detach(pid, state) do
     case state.sessions[pid] do
       %{peer_id: id} = client when is_binary(id) ->
+        was_voice = Map.get(client, :voice_active, false)
+
         state = %{
           state
           | peers: Map.delete(state.peers, id),
-            sessions: Map.put(state.sessions, pid, %{client | peer_id: nil,
-        watch_id: Policy.id(), bound: nil})
+            sessions:
+              Map.put(state.sessions, pid, %{
+                client
+                | peer_id: nil,
+                  watch_id: Policy.id(),
+                  bound: nil,
+                  voice_active: false,
+                  voice_muted: false,
+                  screen_sharing: false
+              })
         }
 
         for {_id, other} <- state.peers,
             do: deliver(other, %{"type" => "rtc_peer_left", "peer_id" => id})
+
+        if was_voice, do: broadcast_voice_notice(state, pid, id, "voice_leave")
 
         state
 
       _ ->
         state
     end
+  end
+
+  defp voice_notices(false, _prev_sharing, true, true),
+    do: ["voice_join", "screen_share_start"]
+
+  defp voice_notices(false, _prev_sharing, true, false),
+    do: ["voice_join"]
+
+  defp voice_notices(true, _prev_sharing, false, _next_sharing),
+    do: ["voice_leave"]
+
+  defp voice_notices(true, false, true, true),
+    do: ["screen_share_start"]
+
+  defp voice_notices(true, true, true, false),
+    do: ["screen_share_stop"]
+
+  defp voice_notices(_, _, _, _),
+    do: []
+
+  defp broadcast_voice_notice(state, sender_pid, peer_id, notice) do
+    payload = %{"type" => "voice_notice", "event" => notice, "peer_id" => peer_id}
+
+    for {_other_id, pid} <- state.peers,
+        pid != sender_pid,
+        match?(%{voice_active: true}, state.sessions[pid]),
+        do: deliver(pid, payload)
   end
 
   defp voice_public(client, id) do
@@ -1129,18 +1179,20 @@ defmodule AgoraBroker.Room do
     |> Map.put("screen_sharing", Map.get(client, :screen_sharing, false))
   end
 
-  defp list_peers(client, state) do
+  defp list_peers(client, state, include_relay \\ false) do
     peers =
       for {id, pid} <- state.peers,
           pid != client.pid,
           do: voice_public(state.sessions[pid], id)
 
-    deliver(client.pid, %{
+    response = %{
       "type" => "rtc_peers",
       "self_peer_id" => client.peer_id,
       "peers" => peers,
       "canvas_protocol" => 2
-    })
+    }
+    response = if include_relay, do: Map.put(response, "media_relay", AgoraBroker.MediaRelay.config(client.identity)), else: response
+    deliver(client.pid, response)
   end
 
   defp filtered_event(%{"event" => %{"type" => "canvas_commit"} = event} = broadcast, identity) do
