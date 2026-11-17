@@ -29,9 +29,12 @@ def read_env(path):
 
 def write_env(env, values):
     if env.is_symlink(): raise ValueError('Refusing a symlinked .env.')
+    ownership = env.stat() if env.exists() else None
     descriptor, temporary = tempfile.mkstemp(prefix='.env-', dir=ROOT)
     try:
         with os.fdopen(descriptor, 'w') as output:
+            if ownership is not None:
+                os.fchown(output.fileno(), ownership.st_uid, ownership.st_gid)
             for key, value in values.items():
                 if any(character in value for character in ('\n', '\r')) or ('\"' in value and "'" in value):
                     raise ValueError(f'Unsupported characters in {key}.')

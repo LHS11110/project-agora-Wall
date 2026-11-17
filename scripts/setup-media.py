@@ -48,5 +48,8 @@ log-file=stdout
 simple-log
 '''.format(secret=secret)
     path=folder/'turnserver.conf';path.write_text(config);path.chmod(0o600)
+    ownership=(root/'.env').stat()
+    os.chown(folder,ownership.st_uid,ownership.st_gid)
+    os.chown(path,ownership.st_uid,ownership.st_gid)
     print('Wall relay configuration prepared; credentials were not printed.')
 if __name__=='__main__':main()
