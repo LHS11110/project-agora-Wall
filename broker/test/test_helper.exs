@@ -33,6 +33,21 @@ defmodule AgoraBroker.TestBackend do
   def query(input) do
     if pid = Application.get_env(:agora_broker, :test_observer), do: send(pid, {:query, input})
 
+    if input["event"]["type"] == "voice_channel_access" do
+      channel = input["event"]["channel"]
+      allowed = channel in Application.get_env(:agora_broker, :test_voice_channels, ["standup"])
+
+      {:ok,
+       %{
+         "route" => input["route"],
+         "response" =>
+           if(allowed,
+             do: %{"type" => "voice_channel_access", "ok" => true, "channel" => channel},
+             else: %{"type" => "error", "ok" => false, "code" => "VOICE_CHANNEL_DENIED"}
+           ),
+         "broadcasts" => []
+       }}
+    else
     if input["event"]["backend_test_error"] do
       {:ok,
        %{
@@ -56,6 +71,7 @@ defmodule AgoraBroker.TestBackend do
          },
          "broadcasts" => [%{"event" => %{"type" => "test_broadcast"}, "permission" => ["group"]}]
        }}
+    end
     end
   end
 end

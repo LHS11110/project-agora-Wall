@@ -1,4 +1,5 @@
 defmodule AgoraBroker.Room do
+  @default_voice_channel "general"
   use GenServer, restart: :temporary
   alias AgoraBroker.Policy
   @max_queue 128
@@ -78,7 +79,8 @@ defmodule AgoraBroker.Room do
        queue: :queue.new(),
        queued_bytes: 0,
        active: nil,
-       runtime_tasks: %{}
+       runtime_tasks: %{},
+       voice_checks: %{}
      }}
   end
 
@@ -116,7 +118,9 @@ defmodule AgoraBroker.Room do
         bound: nil,
         voice_active: false,
         voice_muted: false,
-        screen_sharing: false
+        screen_sharing: false,
+        voice_channel: @default_voice_channel,
+        voice_check: 0
       })
 
     state = %{
@@ -255,27 +259,20 @@ defmodule AgoraBroker.Room do
          state
        )
        when is_binary(id) and is_boolean(active) and is_boolean(muted) do
-    sharing = Map.get(event, "screen_sharing", false)
-    prev_active = Map.get(client, :voice_active, false)
-    prev_sharing = Map.get(client, :screen_sharing, false)
-    next_sharing = active and sharing == true
-    client = %{client | voice_active: active, voice_muted: active and muted, screen_sharing: next_sharing}
+    # Clients without channel support stay in the default call channel.
+    channel = voice_channel(Map.get(event, "channel"))
+    # Every new request supersedes a permission check still in flight.
+    client = Map.update(client, :voice_check, 1, &(&1 + 1))
     state = %{state | sessions: Map.put(state.sessions, client.pid, client)}
 
-    for {_id, pid} <- state.peers,
-        do:
-          deliver(pid, %{
-            "type" => "voice_state",
-            "peer_id" => id,
-            "active" => active,
-            "muted" => client.voice_muted,
-            "screen_sharing" => client.screen_sharing
-          })
+    already_admitted =
+      Map.get(client, :voice_active, false) and Map.get(client, :voice_channel) == channel
 
-    for notice <- voice_notices(prev_active, prev_sharing, active, next_sharing),
-        do: broadcast_voice_notice(state, client.pid, id, notice)
-
-    {:reply, :ok, state}
+    if active and channel != @default_voice_channel and not already_admitted do
+      {:reply, :ok, start_voice_check(client, event, channel, :join, state)}
+    else
+      {:reply, :ok, apply_voice_state(client, event, channel, state)}
+    end
   end
 
   defp handle_event(%{rtc: true, peer_id: id} = client, %{"type" => "rtc_signal"} = event, state)
@@ -284,7 +281,13 @@ defmodule AgoraBroker.Room do
     action = event["action"]
     field = if action == "candidate", do: "candidate", else: "description"
 
-    if target && target != client.pid && action in ["offer", "answer", "candidate"] &&
+    # Calls are negotiated only between peers in the same call channel.
+    same_channel =
+      target != nil &&
+        Map.get(state.sessions[target] || %{}, :voice_channel, @default_voice_channel) ==
+          Map.get(client, :voice_channel, @default_voice_channel)
+
+    if target && target != client.pid && same_channel && action in ["offer", "answer", "candidate"] &&
          is_map(event[field]) && byte_size(Jason.encode!(event)) <= 262_144 do
       public = voice_public(client, id)
 
@@ -624,6 +627,35 @@ defmodule AgoraBroker.Room do
     {:noreply, state}
   end
 
+  def handle_info({ref, result}, %{voice_checks: checks} = state) when is_map_key(checks, ref) do
+    Process.demonitor(ref, [:flush])
+    {check, checks} = Map.pop!(checks, ref)
+    state = %{state | voice_checks: checks}
+
+    state =
+      case result do
+        {:ok, %{"response" => %{"type" => "voice_channel_access", "ok" => true, "channel" => channel}}}
+        when channel == check.channel ->
+          voice_check_passed(check, state)
+
+        _ ->
+          voice_check_failed(check, state)
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{voice_checks: checks} = state)
+      when is_map_key(checks, ref) do
+    {check, checks} = Map.pop!(checks, ref)
+    {:noreply, voice_check_failed(check, %{state | voice_checks: checks})}
+  end
+
+  def handle_info({:voice_revoke, broadcasts}, state),
+    do: {:noreply, revoke_voice_channels(state, broadcasts)}
+
+  def handle_info(:voice_recheck, state), do: {:noreply, recheck_voice_channels(state)}
+
   def handle_info(
         {ref, result},
         %{active: %{ref: ref, entry: %{access_refresh: true} = entry}} = state
@@ -638,6 +670,7 @@ defmodule AgoraBroker.Room do
          %{"route" => ^route, "identity" => identity, "response" => %{"settings" => settings}}}
         when is_map(identity) and is_map(settings) ->
           state = update_access(state, entry.client, identity, settings, entry.refresh_items)
+          send(self(), :voice_recheck)
           %{state | refresh_pending: max(0, state.refresh_pending - 1)}
 
         {:ok, %{"response" => response}} ->
@@ -704,6 +737,8 @@ defmodule AgoraBroker.Room do
               deliver(pid, filtered_event(broadcast, client.identity))
               if broadcast["close"], do: send(pid, {:close, :settings_changed})
             end
+
+            send(self(), {:voice_revoke, result["broadcasts"] || []})
 
             if entry.event["type"] == "canvas_ops" and Map.get(entry, :attempts, 0) > 0 and
                  response["ok"] != true,
@@ -784,6 +819,7 @@ defmodule AgoraBroker.Room do
               not client.rtc and Policy.receives?(client.identity, broadcast) do
             deliver(pid, filtered_event(broadcast, client.identity))
           end
+          send(self(), {:voice_revoke, broadcasts})
           revision = Enum.reduce(broadcasts, state.revision, fn b, r -> max(r, get_in(b, ["event", "revision"]) || 0) end)
           {:noreply, %{state | revision: revision}}
         {:ok, %{"agent_event" => "progress", "text" => text}} when is_binary(text) ->
@@ -1117,6 +1153,7 @@ defmodule AgoraBroker.Room do
     case state.sessions[pid] do
       %{peer_id: id} = client when is_binary(id) ->
         was_voice = Map.get(client, :voice_active, false)
+        was_channel = Map.get(client, :voice_channel, @default_voice_channel)
 
         state = %{
           state
@@ -1129,14 +1166,16 @@ defmodule AgoraBroker.Room do
                   bound: nil,
                   voice_active: false,
                   voice_muted: false,
-                  screen_sharing: false
+                  screen_sharing: false,
+                  voice_channel: @default_voice_channel,
+                  voice_check: Map.get(client, :voice_check, 0) + 1
               })
         }
 
         for {_id, other} <- state.peers,
             do: deliver(other, %{"type" => "rtc_peer_left", "peer_id" => id})
 
-        if was_voice, do: broadcast_voice_notice(state, pid, id, "voice_leave")
+        if was_voice, do: broadcast_voice_notice(state, pid, id, "voice_leave", was_channel)
 
         state
 
@@ -1163,13 +1202,204 @@ defmodule AgoraBroker.Room do
   defp voice_notices(_, _, _, _),
     do: []
 
-  defp broadcast_voice_notice(state, sender_pid, peer_id, notice) do
-    payload = %{"type" => "voice_notice", "event" => notice, "peer_id" => peer_id}
+  defp broadcast_voice_notice(state, sender_pid, peer_id, notice, channel) do
+    payload = %{"type" => "voice_notice", "event" => notice, "peer_id" => peer_id, "channel" => channel}
 
     for {_other_id, pid} <- state.peers,
         pid != sender_pid,
         match?(%{voice_active: true}, state.sessions[pid]),
+        Map.get(state.sessions[pid], :voice_channel, @default_voice_channel) == channel,
         do: deliver(pid, payload)
+  end
+
+  # Call channel ids are canvas item ids chosen by clients; anything else falls
+  # back to the default channel rather than splitting peers on garbage input.
+  defp voice_channel(value) when is_binary(value) do
+    if Regex.match?(~r/\A[A-Za-z0-9_-]{1,96}\z/, value), do: value, else: @default_voice_channel
+  end
+
+  defp voice_channel(_), do: @default_voice_channel
+
+  defp apply_voice_state(client, event, channel, state) do
+    id = client.peer_id
+    active = event["active"]
+    sharing = Map.get(event, "screen_sharing", false)
+    prev_active = Map.get(client, :voice_active, false)
+    prev_sharing = Map.get(client, :screen_sharing, false)
+    prev_channel = Map.get(client, :voice_channel, @default_voice_channel)
+    next_sharing = active and sharing == true
+
+    client = %{
+      client
+      | voice_active: active,
+        voice_muted: active and event["muted"],
+        screen_sharing: next_sharing,
+        voice_channel: channel
+    }
+
+    state = %{state | sessions: Map.put(state.sessions, client.pid, client)}
+
+    for {_id, pid} <- state.peers,
+        do:
+          deliver(pid, %{
+            "type" => "voice_state",
+            "peer_id" => id,
+            "active" => active,
+            "muted" => client.voice_muted,
+            "screen_sharing" => client.screen_sharing,
+            "channel" => channel
+          })
+
+    if prev_active and active and prev_channel != channel do
+      # Moving between call channels: the old channel hears a leave, the new one a join.
+      broadcast_voice_notice(state, client.pid, id, "voice_leave", prev_channel)
+      broadcast_voice_notice(state, client.pid, id, "voice_join", channel)
+      if next_sharing, do: broadcast_voice_notice(state, client.pid, id, "screen_share_start", channel)
+    else
+      notice_channel = if active, do: channel, else: prev_channel
+
+      for notice <- voice_notices(prev_active, prev_sharing, active, next_sharing),
+          do: broadcast_voice_notice(state, client.pid, id, notice, notice_channel)
+    end
+
+    state
+  end
+
+  # Call channels are canvas items; the canvas server confirms that the item is
+  # a voice channel this identity can read before the peer is admitted.
+  defp start_voice_check(client, event, channel, mode, state) do
+    backend = Application.get_env(:agora_broker, :backend, AgoraBroker.Backend)
+    check = %{"type" => "voice_channel_access", "channel" => channel, "request_id" => Policy.id()}
+
+    input = %{
+      "route" => route(client, check),
+      "identity" => Map.drop(client.identity, ["_group_index", "_read_mask"]),
+      "ws_port" => client.ws_port,
+      "event" => check
+    }
+
+    try do
+      task = Task.Supervisor.async_nolink(AgoraBroker.Tasks, fn -> backend.query(input) end)
+
+      put_in(state.voice_checks[task.ref], %{
+        pid: client.pid,
+        event: event,
+        channel: channel,
+        mode: mode,
+        sequence: client.voice_check
+      })
+    rescue
+      RuntimeError -> voice_check_failed(%{pid: client.pid, event: event, channel: channel, mode: mode, sequence: client.voice_check}, state)
+    end
+  end
+
+  defp voice_check_passed(check, state) do
+    case state.sessions[check.pid] do
+      %{peer_id: id, voice_check: sequence} = client when is_binary(id) and sequence == check.sequence ->
+        if check.mode == :join, do: apply_voice_state(client, check.event, check.channel, state), else: state
+
+      _ ->
+        state
+    end
+  end
+
+  defp voice_check_failed(%{mode: :recheck} = check, state) do
+    case state.sessions[check.pid] do
+      %{peer_id: id} = client when is_binary(id) ->
+        if Map.get(client, :voice_active, false) and Map.get(client, :voice_channel) == check.channel,
+          do: revoke_voice(client, state),
+          else: state
+
+      _ ->
+        state
+    end
+  end
+
+  defp voice_check_failed(check, state) do
+    case state.sessions[check.pid] do
+      %{peer_id: id, voice_check: sequence} = client when is_binary(id) and sequence == check.sequence ->
+        if check.mode == :join do
+          deliver(client.pid, %{"type" => "error", "code" => "VOICE_CHANNEL_DENIED", "channel" => check.channel})
+          state
+        else
+          revoke_voice(client, state)
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  # Ends a peer's call in a channel it may no longer use; the client moves to
+  # the default channel on "voice_channel_revoked".
+  defp revoke_voice(client, state) do
+    channel = Map.get(client, :voice_channel, @default_voice_channel)
+
+    state =
+      apply_voice_state(
+        Map.update(client, :voice_check, 1, &(&1 + 1)),
+        %{"active" => false, "muted" => false},
+        @default_voice_channel,
+        state
+      )
+
+    deliver(client.pid, %{"type" => "voice_channel_revoked", "channel" => channel})
+    state
+  end
+
+  defp voice_channel_item?(item),
+    do: is_map(item) and item["kind"] == "channel" and item["channelType"] == "voice"
+
+  # A committed delete or permission change of a call channel removes peers who
+  # can no longer read it.
+  defp revoke_voice_channels(state, broadcasts) do
+    in_use =
+      for {_pid, client} <- state.sessions,
+          client.rtc and is_binary(client.peer_id) and Map.get(client, :voice_active, false),
+          channel = Map.get(client, :voice_channel, @default_voice_channel),
+          channel != @default_voice_channel,
+          into: MapSet.new(),
+          do: channel
+
+    if MapSet.size(in_use) == 0 do
+      state
+    else
+      Enum.reduce(broadcasts, state, fn
+        %{"event" => %{"type" => "canvas_commit", "items" => items}} = broadcast, acc when is_map(items) ->
+          permissions = broadcast["permissions"] || %{}
+
+          Enum.reduce(items, acc, fn {item_id, item}, acc ->
+            if MapSet.member?(in_use, item_id) do
+              Enum.reduce(acc.sessions, acc, fn {_pid, client}, acc ->
+                if client.rtc and is_binary(client.peer_id) and Map.get(client, :voice_active, false) and
+                     Map.get(client, :voice_channel) == item_id and
+                     (not voice_channel_item?(item) or not Policy.visible?(client.identity, permissions[item_id])),
+                   do: revoke_voice(client, acc),
+                   else: acc
+              end)
+            else
+              acc
+            end
+          end)
+
+        _, acc ->
+          acc
+      end)
+    end
+  end
+
+  # Group membership changes can remove access to a channel the peer is in.
+  defp recheck_voice_channels(state) do
+    Enum.reduce(state.sessions, state, fn {_pid, client}, acc ->
+      channel = Map.get(client, :voice_channel, @default_voice_channel)
+
+      if client.rtc and is_binary(client.peer_id) and Map.get(client, :voice_active, false) and
+           channel != @default_voice_channel do
+        start_voice_check(client, %{}, channel, :recheck, acc)
+      else
+        acc
+      end
+    end)
   end
 
   defp voice_public(client, id) do
@@ -1177,6 +1407,7 @@ defmodule AgoraBroker.Room do
     |> Map.put("voice_active", Map.get(client, :voice_active, false))
     |> Map.put("voice_muted", Map.get(client, :voice_muted, false))
     |> Map.put("screen_sharing", Map.get(client, :screen_sharing, false))
+    |> Map.put("voice_channel", Map.get(client, :voice_channel, @default_voice_channel))
   end
 
   defp list_peers(client, state, include_relay \\ false) do

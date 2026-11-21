@@ -24,6 +24,12 @@ defmodule AgoraBroker.ServerSyncBackend do
     end
 
     response =
+      if event["type"] == "voice_channel_access",
+        do:
+          (if event["channel"] in Application.get_env(:agora_broker, :test_voice_channels, ["standup"]),
+             do: %{"type" => "voice_channel_access", "ok" => true, "channel" => event["channel"]},
+             else: %{"type" => "error", "ok" => false, "code" => "VOICE_CHANNEL_DENIED"}),
+        else:
       if event["type"] == "canvas_sync",
         do: %{
           "type" => "canvas_snapshot",
@@ -805,6 +811,103 @@ defmodule AgoraBroker.RoomTest do
 
     send(ws_peer, :stop)
     send(canvas_peer, :stop)
+  end
+
+  test "call channels scope voice notices and signaling to peers in the same channel", %{
+    room: room,
+    canvas: canvas
+  } do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"rtc_canvas_connection_id" => connection, "rtc_canvas_connection_hash" => proof}}
+
+    join_rtc = fn ->
+      pid = listener(room, client(true, canvas))
+      assert_receive {:frame, ^pid, %{"type" => "rtc_ready"}}
+      :ok = Room.submit(room, pid, %{
+        "type" => "rtc_join",
+        "canvas_protocol" => 2,
+        "canvas_transport" => "broker-v1",
+        "canvas_connection_id" => connection,
+        "canvas_connection_hash" => proof
+      })
+      assert_receive {:frame, ^pid, %{"type" => "rtc_peers", "self_peer_id" => peer_id}}
+      {pid, peer_id}
+    end
+
+    {a, a_id} = join_rtc.()
+    {b, b_id} = join_rtc.()
+    {c, c_id} = join_rtc.()
+
+    :ok = Room.submit(room, a, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "standup"})
+    assert_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id, "channel" => "standup"}}
+    # Legacy clients without a channel join the default channel.
+    :ok = Room.submit(room, b, %{"type" => "voice_state", "active" => true, "muted" => false})
+    assert_receive {:frame, ^a, %{"type" => "voice_state", "peer_id" => ^b_id, "channel" => "general"}}
+    refute_receive {:frame, ^a, %{"type" => "voice_notice"}}, 30
+
+    :ok = Room.submit(room, c, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "standup"})
+    assert_receive {:frame, ^a, %{"type" => "voice_notice", "event" => "voice_join", "peer_id" => ^c_id, "channel" => "standup"}}
+    refute_receive {:frame, ^b, %{"type" => "voice_notice"}}, 30
+
+    offer = %{"type" => "rtc_signal", "action" => "offer", "description" => %{"type" => "offer", "sdp" => "v=0"}}
+    :ok = Room.submit(room, a, Map.put(offer, "peer_id", c_id))
+    assert_receive {:frame, ^c, %{"type" => "rtc_signal", "from_peer_id" => ^a_id}}
+    assert {:error, "RTC_SIGNAL_INVALID"} = Room.submit(room, a, Map.put(offer, "peer_id", b_id))
+
+    # Moving channels: the old channel hears a leave and the new one a join.
+    :ok = Room.submit(room, c, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "general"})
+    assert_receive {:frame, ^a, %{"type" => "voice_notice", "event" => "voice_leave", "peer_id" => ^c_id}}
+    assert_receive {:frame, ^b, %{"type" => "voice_notice", "event" => "voice_join", "peer_id" => ^c_id}}
+
+    # Garbage channel ids fall back to the default channel.
+    :ok = Room.submit(room, a, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "../x"})
+    assert_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id, "channel" => "general"}}
+  end
+
+  test "call channels admit only peers the canvas server allows and revoke on delete", %{room: room, canvas: canvas} do
+    :ok = Room.join(room, self(), client(false, canvas))
+    assert_receive {:deliver, %{"rtc_canvas_connection_id" => connection, "rtc_canvas_connection_hash" => proof}}
+
+    join_rtc = fn ->
+      pid = listener(room, client(true, canvas))
+      assert_receive {:frame, ^pid, %{"type" => "rtc_ready"}}
+      :ok = Room.submit(room, pid, %{
+        "type" => "rtc_join",
+        "canvas_protocol" => 2,
+        "canvas_transport" => "broker-v1",
+        "canvas_connection_id" => connection,
+        "canvas_connection_hash" => proof
+      })
+      assert_receive {:frame, ^pid, %{"type" => "rtc_peers", "self_peer_id" => peer_id}}
+      {pid, peer_id}
+    end
+
+    {a, a_id} = join_rtc.()
+    {b, _b_id} = join_rtc.()
+
+    :ok = Room.submit(room, a, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "secret"})
+    assert_receive {:frame, ^a, %{"type" => "error", "code" => "VOICE_CHANNEL_DENIED", "channel" => "secret"}}
+    refute_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id}}, 50
+
+    :ok = Room.submit(room, a, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "standup"})
+    assert_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id, "active" => true, "channel" => "standup"}}
+    # Muting inside an admitted channel does not need another check.
+    :ok = Room.submit(room, a, %{"type" => "voice_state", "active" => true, "muted" => true, "channel" => "standup"})
+    assert_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id, "muted" => true}}
+
+    # Deleting the channel item removes everyone from that call.
+    send(room, {:voice_revoke, [%{"event" => %{"type" => "canvas_commit", "items" => %{"standup" => nil}}, "permissions" => %{"standup" => []}}]})
+    assert_receive {:frame, ^a, %{"type" => "voice_channel_revoked", "channel" => "standup"}}
+    assert_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id, "active" => false, "channel" => "general"}}
+
+    # A permission change that hides the channel also revokes; unrelated items do not.
+    :ok = Room.submit(room, a, %{"type" => "voice_state", "active" => true, "muted" => false, "channel" => "standup"})
+    assert_receive {:frame, ^b, %{"type" => "voice_state", "peer_id" => ^a_id, "active" => true}}
+    channel_item = %{"kind" => "channel", "channelType" => "voice", "name" => "x"}
+    send(room, {:voice_revoke, [%{"event" => %{"type" => "canvas_commit", "items" => %{"other" => nil, "standup" => channel_item}}, "permissions" => %{"standup" => ["group"]}}]})
+    refute_receive {:frame, ^a, %{"type" => "voice_channel_revoked"}}, 50
+    send(room, {:voice_revoke, [%{"event" => %{"type" => "canvas_commit", "items" => %{"standup" => channel_item}}, "permissions" => %{"standup" => ["managers"]}}]})
+    assert_receive {:frame, ^a, %{"type" => "voice_channel_revoked", "channel" => "standup"}}
   end
 
   test "voice notification events reach only other voice-connected peers", %{

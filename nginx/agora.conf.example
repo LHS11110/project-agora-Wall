@@ -23,6 +23,13 @@ map "${FRONTEND_MODE}" $vite_enabled {
     default 0;
     development 1;
 }
+# Production allows only first-party scripts, so injected markup cannot run code.
+# WebAssembly compilation needs 'wasm-unsafe-eval'. Vite's development server
+# injects inline module scripts, so script-src is not restricted there.
+map "${FRONTEND_MODE}" $agora_csp {
+    default "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com; connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'";
+    development "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
+}
 
 # Do not force HTTPS onto other localhost development ports through HSTS.
 map $host $agora_hsts {
@@ -65,7 +72,7 @@ server {
     # Local certificates cover localhost and loopback only. Public deployments
     # must supply their domain's CA-issued fullchain/key using the same mounts.
     add_header Strict-Transport-Security $agora_hsts always;
-    add_header Content-Security-Policy "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:" always;
+    add_header Content-Security-Policy $agora_csp always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-Frame-Options SAMEORIGIN always;
     add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -185,15 +192,24 @@ server {
     location = /index.html {
         try_files $uri @vite;
         add_header Cache-Control "no-cache, no-store, must-revalidate" always;
-        add_header Content-Security-Policy "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:" always;
+        add_header Content-Security-Policy $agora_csp always;
     add_header X-Content-Type-Options nosniff always;
         add_header X-Frame-Options SAMEORIGIN always;
         add_header Referrer-Policy strict-origin-when-cross-origin always;
     }
+    # Sandboxed (opaque-origin) host for user HTML previews. srcdoc frames would
+    # inherit the app policy, so the host gets the preview's own policy instead.
+    location = /html-preview.html {
+        try_files $uri @vite;
+        add_header Cache-Control "no-cache";
+        add_header Content-Security-Policy "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: https:; font-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+    }
     location /assets/ {
         try_files $uri @vite;
         add_header Cache-Control $asset_cache;
-        add_header Content-Security-Policy "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:" always;
+        add_header Content-Security-Policy $agora_csp always;
     add_header X-Content-Type-Options nosniff always;
         add_header X-Frame-Options SAMEORIGIN always;
         add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -202,7 +218,7 @@ server {
         try_files $uri @vite;
         types { application/javascript mjs; }
         add_header Cache-Control "no-cache";
-        add_header Content-Security-Policy "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:" always;
+        add_header Content-Security-Policy $agora_csp always;
     add_header X-Content-Type-Options nosniff always;
         add_header X-Frame-Options SAMEORIGIN always;
         add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -216,7 +232,7 @@ server {
         }
         default_type application/octet-stream;
         add_header Cache-Control "no-cache";
-        add_header Content-Security-Policy "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:" always;
+        add_header Content-Security-Policy $agora_csp always;
     add_header X-Content-Type-Options nosniff always;
         add_header X-Frame-Options SAMEORIGIN always;
         add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -224,7 +240,7 @@ server {
     location /mathjax/ {
         try_files $uri @vite;
         add_header Cache-Control "no-cache";
-        add_header Content-Security-Policy "connect-src https: wss:; img-src https: data: blob:; media-src https: blob: data:; frame-src https:" always;
+        add_header Content-Security-Policy $agora_csp always;
     add_header X-Content-Type-Options nosniff always;
         add_header X-Frame-Options SAMEORIGIN always;
         add_header Referrer-Policy strict-origin-when-cross-origin always;

@@ -136,7 +136,7 @@ normal server-authoritative `canvas_ops`; code nodes do not independently execut
 
 ### Canvas voice calls
 
-Authenticated RTC members may submit `{type:"voice_state",active:boolean,muted:boolean,screen_sharing?:boolean}`.
+Authenticated RTC members may submit `{type:"voice_state",active:boolean,muted:boolean,screen_sharing?:boolean,channel?:string}`.
 The broker broadcasts the normalized state with its authenticated `peer_id` to this
 canvas only. It ignores a caller-supplied peer ID, rejects unjoined sockets, and
 never persists voice state. `rtc_peers.peers[]` includes `voice_active`,
@@ -147,6 +147,15 @@ member normally. Genuine voice membership or screen-share transitions (`voice_jo
 currently marked `voice_active: true`.
 Audio travels over WebRTC between opted-in users; existing `rtc_signal` forwards
 SDP/ICE to the specified room member. Canvas documents continue through the broker.
+
+**Call channels.** `voice_state` may carry `channel` (`[A-Za-z0-9_-]{1,96}`, normally
+a canvas channel item id); a missing or invalid value means `"general"`, so older
+clients stay in the default channel. The broker echoes `channel` in `voice_state`,
+exposes it as `voice_channel` in `rtc_peers`/`rtc_peer_joined`, sends `voice_notice`
+(now including `channel`) only to voice-active peers in that channel, and forwards
+`rtc_signal` only between peers in the same channel. Moving channels while active
+emits `voice_leave` to the old channel and `voice_join` to the new one. The broker
+does not read canvas items, so channel item permissions are not enforced for calls.
 
 ## VM 관리 작업 (2026-11-12)
 
