@@ -272,9 +272,42 @@ defmodule AgoraBroker.RoomTest do
     for key <- [12, true, "with space", "with\nnewline", String.duplicate("x",4097)] do
       assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "operation" => "status", "api_key" => key})
     end
-    for options <- [%{"max_tokens" => 999999}, %{"reasoning_effort" => "medium"}, %{"api_key" => "forged"}, %{"max_steps" => 1.5}] do
+    for options <- [%{"max_tokens" => 999999}, %{"reasoning_effort" => "medium"}, %{"api_key" => "forged"}, %{"max_steps" => 1.5}, %{"engine" => "local"}, %{"cli_tool" => "rm"}, %{"cli_command" => "echo\nid"}] do
       assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "message" => "hi", "options" => options})
     end
+  end
+
+  test "cli agent operations validate execute and write permissions and forward valid options", %{room: room, canvas: canvas} do
+    base = client(false, canvas)
+    :ok = Room.join(room, self(), base)
+    assert_receive {:deliver, %{"type" => "init_items"}}
+
+    # Reader without execute permission cannot query CLI status, install, or run CLI agent.
+    assert {:error, "RUNTIME_EXECUTION_DENIED"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "operation" => "cli_status"})
+    assert {:error, "RUNTIME_EXECUTION_DENIED"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "operation" => "cli_install", "cli_tool" => "claude"})
+    assert {:error, "RUNTIME_EXECUTION_DENIED"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "message" => "hello", "options" => %{"engine" => "cli", "cli_tool" => "claude"}})
+
+    # Peer with execute permission (no write_groups) can check cli_status and run cli agent, but cannot install/uninstall.
+    exec_peer = listener(room, %{base | identity: Map.put(base.identity, "execute_groups", ["group"])})
+    assert_receive {:frame, ^exec_peer, %{"type" => "init_items"}}
+    assert :ok = Room.submit(room, exec_peer, %{"type" => "runtime_execute", "action" => "agent", "operation" => "cli_status", "request_id" => "cli-st"})
+    assert_receive {:query, input}
+    assert input["event"]["operation"] == "cli_status"
+    assert {:error, "RUNTIME_EXECUTION_DENIED"} = Room.submit(room, exec_peer, %{"type" => "runtime_execute", "action" => "agent", "operation" => "cli_install", "cli_tool" => "claude"})
+    assert :ok = Room.submit(room, exec_peer, %{"type" => "runtime_execute", "action" => "agent", "operation" => "run", "message" => "read canvas", "options" => %{"engine" => "cli", "cli_tool" => "claude", "cli_model" => "claude-sonnet-4-5"}, "request_id" => "cli-run"})
+    assert_receive {:query, run_input}
+    assert run_input["event"]["options"]["engine"] == "cli"
+    assert run_input["event"]["options"]["cli_tool"] == "claude"
+    send(exec_peer, :stop)
+
+    # Peer with execute + write_groups can install/uninstall supported CLI tools.
+    writer_exec = listener(room, %{base | identity: base.identity |> Map.put("execute_groups", ["group"]) |> Map.put("write_groups", ["group"])})
+    assert_receive {:frame, ^writer_exec, %{"type" => "init_items"}}
+    assert :ok = Room.submit(room, writer_exec, %{"type" => "runtime_execute", "action" => "agent", "operation" => "cli_install", "cli_tool" => "codex", "request_id" => "cli-inst"})
+    assert_receive {:query, inst_input}
+    assert inst_input["event"]["operation"] == "cli_install"
+    assert inst_input["event"]["cli_tool"] == "codex"
+    send(writer_exec, :stop)
   end
 
   test "runtime management requires write plus execute, while readers may inspect settings", %{room: room, canvas: canvas} do
