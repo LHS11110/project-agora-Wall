@@ -457,13 +457,17 @@ defmodule AgoraBroker.Room do
     end
   end
 
-  defp runtime_category(%{"action" => "agent", "operation" => operation}) when operation in ["status", "cli_status", "sessions", "session_get", "session_delete"], do: "agent_status"
+  defp runtime_category(%{"action" => "agent", "operation" => operation}) when operation in ["status", "cli_status", "cli_cancel", "sessions", "session_get", "session_delete"], do: "agent_status"
   defp runtime_category(%{"action" => action}) when action in ["agent", "service"], do: action
   defp runtime_category(_), do: "vm"
 
   defp runtime_busy?(event,state) do
     kind = runtime_category(event)
-    limit = if kind in ["service", "agent_status"], do: 4, else: 1
+    limit = cond do
+      kind in ["service", "agent_status"] -> 4
+      kind == "agent" -> 2
+      true -> 1
+    end
     Enum.count(state.runtime_tasks, fn {_,entry} -> runtime_category(entry.event) == kind end) >= limit
   end
 
@@ -480,7 +484,10 @@ defmodule AgoraBroker.Room do
       event["operation"] in ["cli_install", "cli_uninstall"] ->
         Policy.can_execute?(identity) and (identity["is_admin"] == true or (identity["write_groups"] || []) != [])
 
-      event["operation"] == "cli_status" or get_in(event, ["options", "engine"]) == "cli" ->
+      get_in(event, ["options", "cli_tool"]) == "custom" ->
+        identity["is_admin"] == true
+
+      event["operation"] in ["cli_status", "cli_cancel"] or get_in(event, ["options", "engine"]) == "cli" ->
         Policy.can_execute?(identity)
 
       true ->
@@ -506,6 +513,8 @@ defmodule AgoraBroker.Room do
 
   defp agent_options_valid?(options) when is_map(options) do
     Enum.all?(options, fn
+      {"provider", value} -> value == "anthropic"
+      {"model", value} -> value in ["", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
       {"reasoning_effort", value} -> value in ["low", "high", "max"]
       {"max_tokens", value} -> is_integer(value) and value in 512..32768
       {"max_steps", value} -> is_integer(value) and value in 1..12
@@ -515,16 +524,18 @@ defmodule AgoraBroker.Room do
       {"cli_tool", value} -> value in ["claude", "codex", "gemini", "opencode", "custom"]
       {"cli_model", value} -> is_binary(value) and byte_size(value) <= 128 and String.match?(value, ~r/\A[\x20-\x7e]*\z/)
       {"cli_command", value} -> is_binary(value) and byte_size(value) <= 512 and not String.contains?(value, ["\0", "\n", "\r"])
+      {"locale", value} -> value in ["ko", "en", "zh", "ja", "fr"]
       _ -> false
     end)
   end
   defp agent_options_valid?(_), do: false
 
   defp runtime_request_valid?(%{"action" => "agent"} = event) do
-    is_binary(Map.get(event, "api_key", "")) and byte_size(Map.get(event, "api_key", "")) <= 4096 and
-      String.match?(Map.get(event, "api_key", ""), ~r/\A[\x21-\x7e]*\z/) and
+    Map.get(event, "api_key", "") == "" and
+    (event["operation"] not in [nil, "run"] or get_in(event, ["options", "engine"]) == "cli" or
+      event["consent_version"] == "claude-prompt-v1") and
     agent_options_valid?(Map.get(event, "options", %{})) and
-    event["operation"] in [nil, "run", "status", "cli_status", "cli_install", "cli_uninstall", "sessions", "session_get", "session_delete"] and
+    event["operation"] in [nil, "run", "status", "cli_status", "cli_install", "cli_uninstall", "cli_cancel", "sessions", "session_get", "session_delete"] and
       (is_nil(event["cli_tool"]) or event["cli_tool"] in ["claude", "codex", "gemini", "opencode"]) and
       (is_nil(event["session_id"]) or (is_binary(event["session_id"]) and byte_size(event["session_id"]) in 1..128)) and
       (is_nil(event["turn_id"]) or (is_binary(event["turn_id"]) and byte_size(event["turn_id"]) in 1..128)) and
@@ -532,7 +543,7 @@ defmodule AgoraBroker.Room do
       (is_nil(event["offset"]) or (is_integer(event["offset"]) and event["offset"] in 0..10000000)) and
       (is_nil(event["before"]) or (is_integer(event["before"]) and event["before"] >= 0)) and
       (is_nil(event["limit"]) or (is_integer(event["limit"]) and event["limit"] in 1..100)) and
-      (event["operation"] in ["status", "cli_status", "cli_install", "cli_uninstall", "sessions", "session_get", "session_delete"] or (is_binary(event["message"]) and byte_size(event["message"]) in 1..24_000)) and
+      (event["operation"] in ["status", "cli_status", "cli_install", "cli_uninstall", "cli_cancel", "sessions", "session_get", "session_delete"] or (is_binary(event["message"]) and byte_size(event["message"]) in 1..24_000)) and
       is_list(event["selected_ids"] || []) and length(event["selected_ids"] || []) <= 20 and
       Enum.all?(event["selected_ids"] || [], fn id -> is_binary(id) and byte_size(id) in 1..128 end) and
       is_list(event["history"] || []) and length(event["history"] || []) <= 12 and
