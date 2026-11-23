@@ -500,12 +500,9 @@ defmodule AgoraBroker.Room do
   end
 
   defp agent_options_valid?(options) when is_map(options) do
-    external = options["provider"] == "openrouter"
     Enum.all?(options, fn
-      {"provider", value} -> value in ["anthropic", "openrouter"]
-      {"model", value} when external -> is_binary(value) and byte_size(value) <= 128 and
-        String.match?(value, ~r/\Aanthropic\/claude-[a-zA-Z0-9._-]+\z/)
-      {"model", value} -> value in ["", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
+      {"provider", value} -> value == "local"
+      {"model", value} -> value in ["", "qwen2.5:1.5b"]
       {"reasoning_effort", value} -> value in ["low", "high", "max"]
       {"max_tokens", value} -> is_integer(value) and value in 512..32768
       {"max_steps", value} -> is_integer(value) and value in 1..12
@@ -519,17 +516,8 @@ defmodule AgoraBroker.Room do
   defp agent_options_valid?(_), do: false
 
   defp runtime_request_valid?(%{"action" => "agent"} = event) do
-    run = event["operation"] in [nil, "run"]
-    options = Map.get(event, "options", %{})
-    external = is_map(options) and options["provider"] == "openrouter"
-    key = event["api_key"]
-
-    (if run and external do
-      is_binary(key) and byte_size(key) <= 256 and String.match?(key, ~r/\Ask-or-v1-[a-zA-Z0-9_-]+\z/)
-    else
-      is_nil(key)
-    end) and
-    (event["operation"] not in [nil, "run"] or event["consent_version"] == "agent-adult-v3") and
+    not Map.has_key?(event, "api_key") and
+    (event["operation"] not in [nil, "run"] or event["consent_version"] == "agent-local-v2") and
     agent_options_valid?(Map.get(event, "options", %{})) and
     event["operation"] in [nil, "run", "status", "sessions", "session_get", "session_delete"] and
       (is_nil(event["session_id"]) or (is_binary(event["session_id"]) and byte_size(event["session_id"]) in 1..128)) and

@@ -205,7 +205,7 @@ defmodule AgoraBroker.RoomTest do
     hidden = listener(room, client(false, canvas, "other"))
     assert_receive {:frame, ^peer, %{"type" => "init_items"}}
     assert_receive {:frame, ^hidden, %{"type" => "init_items"}}
-    event = %{"type" => "runtime_execute", "action" => "agent", "message" => "코드를 작성해줘", "consent_version" => "agent-adult-v3", "options" => %{"provider" => "anthropic", "model" => "claude-sonnet-5-5"}, "request_id" => "agent-1", "wait" => true}
+    event = %{"type" => "runtime_execute", "action" => "agent", "message" => "코드를 작성해줘", "consent_version" => "agent-local-v2", "options" => %{"provider" => "local", "model" => "qwen2.5:1.5b"}, "request_id" => "agent-1", "wait" => true}
     :ok = Room.submit(room, self(), event)
     assert_receive {:query, input}
     assert input["identity"]["user_id"] == 7
@@ -234,7 +234,7 @@ defmodule AgoraBroker.RoomTest do
     assert_receive {:deliver, %{"type" => "init_items"}}
     status = %{"type" => "runtime_execute", "action" => "agent", "operation" => "status", "request_id" => "status", "wait" => true}
     status = %{status | "operation" => "sessions"}
-    run = %{"type" => "runtime_execute", "action" => "agent", "operation" => "run", "message" => "test", "consent_version" => "agent-adult-v3", "request_id" => "run", "wait" => true}
+    run = %{"type" => "runtime_execute", "action" => "agent", "operation" => "run", "message" => "test", "consent_version" => "agent-local-v2", "request_id" => "run", "wait" => true}
     :ok = Room.submit(room, self(), status)
     assert_receive {:waiting, status_worker}
     :ok = Room.submit(room, self(), Map.put(run, "request_id", "run-1"))
@@ -276,25 +276,25 @@ defmodule AgoraBroker.RoomTest do
       assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "operation" => "status", "api_key" => key})
     end
     for options <- [%{"provider" => "gemini"}, %{"model" => "custom"}, %{"max_tokens" => 999999}, %{"reasoning_effort" => "medium"}, %{"api_key" => "forged"}, %{"max_steps" => 1.5}, %{"engine" => "local"}, %{"cli_tool" => "rm"}, %{"cli_command" => "echo\nid"}, %{"locale" => "de"}] do
-      assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "message" => "hi", "consent_version" => "agent-adult-v3", "options" => options})
+      assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), %{"type" => "runtime_execute", "action" => "agent", "message" => "hi", "consent_version" => "agent-local-v2", "options" => options})
     end
   end
 
-  test "external agent requests require a developer key and reject CLI or caller-chosen destinations", %{room: room, canvas: canvas} do
+  test "canvas agents reject old terms, cloud providers and personal credentials", %{room: room, canvas: canvas} do
     :ok = Room.join(room, self(), client(false, canvas))
     assert_receive {:deliver, %{"type" => "init_items"}}
 
     event = %{"type" => "runtime_execute", "action" => "agent", "operation" => "run",
-      "message" => "test", "consent_version" => "agent-adult-v3", "request_id" => "external-run",
-      "options" => %{"provider" => "openrouter", "model" => "anthropic/claude-example"}}
+      "message" => "test", "consent_version" => "agent-local-v2", "request_id" => "local-run",
+      "options" => %{"provider" => "local", "model" => "qwen2.5:1.5b"}}
 
-    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), event)
-    keyed = Map.put(event, "api_key", "sk-or-v1-test")
-    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), put_in(keyed, ["options", "endpoint"], "https://example.invalid"))
-    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.put(keyed, "operation", "cli_status"))
-    assert :ok = Room.submit(room, self(), keyed)
+    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.put(event, "consent_version", "agent-adult-v3"))
+    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), put_in(event, ["options", "provider"], "anthropic"))
+    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.put(event, "api_key", "sk-or-v1-test"))
+    assert :ok = Room.submit(room, self(), event)
     assert_receive {:query, input}
-    assert input["event"]["api_key"] == "sk-or-v1-test"
+    assert input["event"]["options"]["provider"] == "local"
+    refute Map.has_key?(input["event"], "api_key")
   end
 
   test "runtime management requires write plus execute, while readers may inspect settings", %{room: room, canvas: canvas} do
