@@ -457,7 +457,7 @@ defmodule AgoraBroker.Room do
     end
   end
 
-  defp runtime_category(%{"action" => "agent", "operation" => operation}) when operation in ["status", "cli_status", "cli_cancel", "sessions", "session_get", "session_delete"], do: "agent_status"
+  defp runtime_category(%{"action" => "agent", "operation" => operation}) when operation in ["status", "sessions", "session_get", "session_delete"], do: "agent_status"
   defp runtime_category(%{"action" => action}) when action in ["agent", "service"], do: action
   defp runtime_category(_), do: "vm"
 
@@ -479,20 +479,8 @@ defmodule AgoraBroker.Room do
         ((identity["groups"] || []) != [] and (read or (identity["write_groups"] || []) != [])))
   end
 
-  defp runtime_allowed?(identity, %{"action" => "agent"} = event) do
-    cond do
-      event["operation"] in ["cli_install", "cli_uninstall"] ->
-        Policy.can_execute?(identity) and (identity["is_admin"] == true or (identity["write_groups"] || []) != [])
-
-      get_in(event, ["options", "cli_tool"]) == "custom" ->
-        identity["is_admin"] == true
-
-      event["operation"] in ["cli_status", "cli_cancel"] or get_in(event, ["options", "engine"]) == "cli" ->
-        Policy.can_execute?(identity)
-
-      true ->
-        identity["is_admin"] == true or (identity["groups"] || []) != []
-    end
+  defp runtime_allowed?(identity, %{"action" => "agent"}) do
+    identity["is_admin"] == true or (identity["groups"] || []) != []
   end
 
   defp runtime_allowed?(identity, event) do
@@ -512,18 +500,18 @@ defmodule AgoraBroker.Room do
   end
 
   defp agent_options_valid?(options) when is_map(options) do
+    external = options["provider"] == "openrouter"
     Enum.all?(options, fn
-      {"provider", value} -> value == "anthropic"
+      {"provider", value} -> value in ["anthropic", "openrouter"]
+      {"model", value} when external -> is_binary(value) and byte_size(value) <= 128 and
+        String.match?(value, ~r/\Aanthropic\/claude-[a-zA-Z0-9._-]+\z/)
       {"model", value} -> value in ["", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]
       {"reasoning_effort", value} -> value in ["low", "high", "max"]
       {"max_tokens", value} -> is_integer(value) and value in 512..32768
       {"max_steps", value} -> is_integer(value) and value in 1..12
       {"temperature", value} -> is_number(value) and value >= 0 and value <= 2
       {"top_p", value} -> is_number(value) and value >= 0.05 and value <= 1
-      {"engine", value} -> value in ["api", "cli"]
-      {"cli_tool", value} -> value in ["claude", "codex", "gemini", "opencode", "custom"]
-      {"cli_model", value} -> is_binary(value) and byte_size(value) <= 128 and String.match?(value, ~r/\A[\x20-\x7e]*\z/)
-      {"cli_command", value} -> is_binary(value) and byte_size(value) <= 512 and not String.contains?(value, ["\0", "\n", "\r"])
+      {"engine", value} -> value == "api"
       {"locale", value} -> value in ["ko", "en", "zh", "ja", "fr"]
       _ -> false
     end)
@@ -531,19 +519,26 @@ defmodule AgoraBroker.Room do
   defp agent_options_valid?(_), do: false
 
   defp runtime_request_valid?(%{"action" => "agent"} = event) do
-    Map.get(event, "api_key", "") == "" and
-    (event["operation"] not in [nil, "run"] or get_in(event, ["options", "engine"]) == "cli" or
-      event["consent_version"] == "claude-prompt-v1") and
+    run = event["operation"] in [nil, "run"]
+    options = Map.get(event, "options", %{})
+    external = is_map(options) and options["provider"] == "openrouter"
+    key = event["api_key"]
+
+    (if run and external do
+      is_binary(key) and byte_size(key) <= 256 and String.match?(key, ~r/\Ask-or-v1-[a-zA-Z0-9_-]+\z/)
+    else
+      is_nil(key)
+    end) and
+    (event["operation"] not in [nil, "run"] or event["consent_version"] == "agent-adult-v3") and
     agent_options_valid?(Map.get(event, "options", %{})) and
-    event["operation"] in [nil, "run", "status", "cli_status", "cli_install", "cli_uninstall", "cli_cancel", "sessions", "session_get", "session_delete"] and
-      (is_nil(event["cli_tool"]) or event["cli_tool"] in ["claude", "codex", "gemini", "opencode"]) and
+    event["operation"] in [nil, "run", "status", "sessions", "session_get", "session_delete"] and
       (is_nil(event["session_id"]) or (is_binary(event["session_id"]) and byte_size(event["session_id"]) in 1..128)) and
       (is_nil(event["turn_id"]) or (is_binary(event["turn_id"]) and byte_size(event["turn_id"]) in 1..128)) and
       event["include_history"] in [nil,true,false] and
       (is_nil(event["offset"]) or (is_integer(event["offset"]) and event["offset"] in 0..10000000)) and
       (is_nil(event["before"]) or (is_integer(event["before"]) and event["before"] >= 0)) and
       (is_nil(event["limit"]) or (is_integer(event["limit"]) and event["limit"] in 1..100)) and
-      (event["operation"] in ["status", "cli_status", "cli_install", "cli_uninstall", "cli_cancel", "sessions", "session_get", "session_delete"] or (is_binary(event["message"]) and byte_size(event["message"]) in 1..24_000)) and
+      (event["operation"] in ["status", "sessions", "session_get", "session_delete"] or (is_binary(event["message"]) and byte_size(event["message"]) in 1..24_000)) and
       is_list(event["selected_ids"] || []) and length(event["selected_ids"] || []) <= 20 and
       Enum.all?(event["selected_ids"] || [], fn id -> is_binary(id) and byte_size(id) in 1..128 end) and
       is_list(event["history"] || []) and length(event["history"] || []) <= 12 and
@@ -594,7 +589,7 @@ defmodule AgoraBroker.Room do
 
     case task do
       {:ok, task} ->
-        task_info = %{client: client, event: event, route: route, pid: task.pid}
+        task_info = %{client: client, event: Map.delete(event, "api_key"), route: route, pid: task.pid}
         put_in(state.runtime_tasks[task.ref], task_info)
 
       {:error, code} ->
