@@ -517,7 +517,7 @@ defmodule AgoraBroker.Room do
 
   defp runtime_request_valid?(%{"action" => "agent"} = event) do
     not Map.has_key?(event, "api_key") and
-    (event["operation"] not in [nil, "run"] or event["consent_version"] == "agent-local-v2") and
+    (event["operation"] not in [nil, "run"] or event["consent_version"] == "agent-local-v3") and
     agent_options_valid?(Map.get(event, "options", %{})) and
     event["operation"] in [nil, "run", "status", "sessions", "session_get", "session_delete"] and
       (is_nil(event["session_id"]) or (is_binary(event["session_id"]) and byte_size(event["session_id"]) in 1..128)) and
@@ -527,11 +527,14 @@ defmodule AgoraBroker.Room do
       (is_nil(event["before"]) or (is_integer(event["before"]) and event["before"] >= 0)) and
       (is_nil(event["limit"]) or (is_integer(event["limit"]) and event["limit"] in 1..100)) and
       (event["operation"] in ["status", "sessions", "session_get", "session_delete"] or (is_binary(event["message"]) and byte_size(event["message"]) in 1..24_000)) and
-      is_list(event["selected_ids"] || []) and length(event["selected_ids"] || []) <= 20 and
+      is_list(event["selected_ids"] || []) and length(event["selected_ids"] || []) <= 10 and
       Enum.all?(event["selected_ids"] || [], fn id -> is_binary(id) and byte_size(id) in 1..128 end) and
       is_list(event["history"] || []) and length(event["history"] || []) <= 12 and
       Enum.all?(event["history"] || [], fn h -> is_map(h) and h["role"] in ["user", "assistant"] and is_binary(h["content"]) and byte_size(h["content"]) <= 24_000 end) and
-      event["allow_delete"] in [nil, true, false]
+      is_nil(event["allow_delete"]) and
+      (is_nil(event["confirmed_delete_id"]) or
+        (event["operation"] in [nil, "run"] and is_binary(event["confirmed_delete_id"]) and
+          event["selected_ids"] == [event["confirmed_delete_id"]]))
   end
 
   defp runtime_request_valid?(event) do
