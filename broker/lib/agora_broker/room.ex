@@ -532,6 +532,9 @@ defmodule AgoraBroker.Room do
       is_list(event["history"] || []) and length(event["history"] || []) <= 12 and
       Enum.all?(event["history"] || [], fn h -> is_map(h) and h["role"] in ["user", "assistant"] and is_binary(h["content"]) and byte_size(h["content"]) <= 24_000 end) and
       is_nil(event["allow_delete"]) and
+      (is_nil(event["confirmed_edit_id"]) or
+        (event["operation"] in [nil, "run"] and is_binary(event["confirmed_edit_id"]) and
+          is_nil(event["confirmed_delete_id"]) and event["selected_ids"] == [event["confirmed_edit_id"]])) and
       (is_nil(event["confirmed_delete_id"]) or
         (event["operation"] in [nil, "run"] and is_binary(event["confirmed_delete_id"]) and
           event["selected_ids"] == [event["confirmed_delete_id"]]))

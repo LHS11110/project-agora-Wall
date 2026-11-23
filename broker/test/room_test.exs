@@ -293,6 +293,8 @@ defmodule AgoraBroker.RoomTest do
     assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.put(event, "api_key", "sk-or-v1-test"))
     assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.merge(event, %{"confirmed_delete_id" => "other", "selected_ids" => ["chosen"]}))
     assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.put(event, "allow_delete", true))
+    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.merge(event, %{"confirmed_edit_id" => "other", "selected_ids" => ["chosen"]}))
+    assert {:error, "RUNTIME_REQUEST_INVALID"} = Room.submit(room, self(), Map.merge(event, %{"confirmed_edit_id" => "chosen", "confirmed_delete_id" => "chosen", "selected_ids" => ["chosen"]}))
     assert :ok = Room.submit(room, self(), Map.merge(event, %{"confirmed_delete_id" => "chosen", "selected_ids" => ["chosen"]}))
     assert_receive {:query, input}
     assert input["event"]["confirmed_delete_id"] == "chosen"
